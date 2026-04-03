@@ -1,0 +1,95 @@
+---
+title: "Yù Yú: Decoding Agent Harness"
+description: "A deep architectural analysis of Claude Code — dissecting the Agent Harness skeleton across 15 chapters, from the dialog loop to building your own AI agent runtime."
+---
+
+## What is this book?
+
+*"Of all instruments, the chariot demands the most hands to build."* — *Kǎo Gōng Jì* (Rites of Zhou, c. 300 BC)
+
+While everyone teaches you how to **use** AI Agents — **this book dissects one.**
+
+This is a 420,000-character technical book that performs a deep architectural analysis of Claude Code, Anthropic's terminal-based AI programming agent. Rather than a usage tutorial or prompt guide, this book systematically reverse-engineers the **Agent Harness** — the engineering runtime that makes an LLM truly operational.
+
+The book is named **Yù Yú** (御舆), after the ancient Chinese chariot. Two thousand years ago, the chariot was the most complex engineered system of its time. Today, building a production AI Agent requires the same multi-disciplinary craftsmanship: tool systems, permission pipelines, context management, streaming architecture — each subsystem its own craft, working together to let intelligence move.
+
+<CardGroup cols={2}>
+  <Card title="Read the Foreword" icon="book-open" href="/foreword">
+    Understand why this book was written and how to navigate it
+  </Card>
+  <Card title="Part 1: Foundations" icon="building" href="/part1/01-new-paradigm">
+    Start with the new paradigm of Agent programming
+  </Card>
+  <Card title="Quick Reference" icon="table" href="/appendix/b-tool-inventory">
+    Jump straight to the tool inventory, feature flags, or glossary
+  </Card>
+  <Card title="Build Your Own Harness" icon="hammer" href="/part4/15-build-your-own-harness">
+    Skip to the hands-on implementation roadmap
+  </Card>
+</CardGroup>
+
+## What makes this book different
+
+This book is **architecture analysis, not API documentation**. It answers "why designed this way" — tracing motivations, analyzing trade-offs, and identifying anti-patterns.
+
+| What you'll find | What you won't find |
+|---|---|
+| Why the dialog loop uses an async generator | How to write better prompts |
+| How the four-stage permission pipeline works | A list of Claude Code tips and tricks |
+| The design decisions behind context compression | Step-by-step API call tutorials |
+| How sub-agents inherit context through Fork | Marketing copy |
+
+## The book by the numbers
+
+<CardGroup cols={2}>
+  <Card title="15 chapters + 4 appendices" icon="list-ol">
+    Organized into four parts: Foundations, Core Systems, Advanced Patterns, and Engineering Practice
+  </Card>
+  <Card title="139 architecture diagrams" icon="diagram-project">
+    Mermaid diagrams covering state machines, data flows, and system architectures
+  </Card>
+  <Card title="50+ design decisions analyzed" icon="magnifying-glass">
+    Each "why designed this way" question answered with engineering context
+  </Card>
+  <Card title="100-term bilingual glossary" icon="language">
+    Chinese–English parallel terminology with chapter cross-references
+  </Card>
+</CardGroup>
+
+## How to navigate this book
+
+<Tabs>
+  <Tab title="Short on time">
+    Read **Chapter 01 → 02 → 04 → 15** for the core cognitive model and hands-on skills. These four chapters give you the essentials of Agent Harness design in the most efficient path.
+  </Tab>
+  <Tab title="Experienced engineer">
+    Jump directly to **Part 2 + Part 3** for subsystem deep-dives. Backtrack to Part 1 only when you hit a concept gap. Focus on the "design decision analysis" subsections in each chapter.
+  </Tab>
+  <Tab title="Systematic study">
+    Read cover to cover, completing the exercises in each chapter. Budget **2–3 weeks** to reach Chapter 15, where you'll build your own Agent Harness from scratch.
+  </Tab>
+  <Tab title="Just need reference">
+    Go straight to the [Appendices](/appendix/a-architecture-map): Architecture Map (A), Tool Inventory (B), Feature Flags (C), or Glossary (D).
+  </Tab>
+</Tabs>
+
+## The four parts
+
+<Steps>
+  <Step title="Part 1: Foundations — Building Mental Models">
+    Chapters 1–4 establish the core paradigm shift from Copilot to autonomous agents. You'll understand the `while(true)` async generator loop, the `Tool<I,O,P>` protocol, and the four-stage permission pipeline.
+  </Step>
+  <Step title="Part 2: Core Systems — Deep Into Subsystems">
+    Chapters 5–8 dissect the four major subsystems: configuration priority chains, the memory system, context compression algorithms, and the lifecycle hook system with 26 events.
+  </Step>
+  <Step title="Part 3: Advanced Patterns — Composition & Extension">
+    Chapters 9–12 explore sub-agent Fork inheritance, multi-agent coordinator patterns, the skill plugin architecture, and MCP protocol integration across 8 transport types.
+  </Step>
+  <Step title="Part 4: Engineering Practice — From Principles to Construction">
+    Chapters 13–15 cover streaming architecture performance (160ms → 65ms startup), Plan Mode structured workflows, and a six-step roadmap for building your own Agent Harness.
+  </Step>
+</Steps>
+
+<Note>
+This book is based on architectural analysis of Claude Code's public documentation and product behavior. No unpublished or unauthorized source code was used. Claude Code is a product of Anthropic PBC. This book is not affiliated with, authorized by, or representative of Anthropic.
+</Note>

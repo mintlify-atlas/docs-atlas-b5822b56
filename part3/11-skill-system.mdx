@@ -1,0 +1,439 @@
+---
+title: "The Skill System & Plugin Architecture"
+description: "How Claude Code's layered skill system works — from the 11 core built-in skills to custom SKILL.md definitions, three-level parameter substitution, conditional activation, and the plugin cache architecture."
+---
+
+Claude Code's skill system is a multi-layered extension mechanism that allows users to define reusable prompt templates through Markdown files, and allows developers to register compile-time built-in skills through TypeScript code. The design goal is **zero-configuration usability, configurable power**.
+
+Think of it as a chef's toolbox: built-in knives and pots (built-in skills) handle most needs, but specialized cuisines require specialized tools (custom skills). And those tools can be managed in tiers — home kitchen (user level), restaurant kitchen (project level), chain restaurant standards (managed level).
+
+---
+
+## The 11 core built-in skills
+
+Built-in skills are compiled into the CLI binary and available out of the box for all users. They are registered at startup through `initBundledSkills()` and fall into two categories: core skills (always registered) and feature-gated skills (only registered when the corresponding feature flag is enabled).
+
+<CardGroup cols={2}>
+  <Card title="Code quality layer" icon="shield-check">
+    - **`verify`** — Verify correctness of code changes; run before committing or before CI
+    - **`debug`** — Debugging assistance and diagnostic approaches for locating bug root causes
+    - **`simplify`** — Code simplification and refactoring review; eliminate duplicate code and reduce cyclomatic complexity
+  </Card>
+  <Card title="Workflow layer" icon="workflow">
+    - **`batch`** — Batch file processing; rename or format files in bulk
+    - **`stuck`** — Help the model escape a loop; "bailout" instruction when the model is stuck
+    - **`skillify`** — Convert one-off prompts into reusable skills
+  </Card>
+  <Card title="Configuration layer" icon="settings">
+    - **`update-config`** — Configure settings in `settings.json` (permissions, environment variables, default models)
+    - **`remember`** — Memory management; add project conventions and team agreements to CLAUDE.md
+    - **`keybindings-help`** — Keyboard shortcut customization help
+  </Card>
+  <Card title="Utility layer" icon="package">
+    - **`lorem-ipsum`** — Generate placeholder content during UI development
+    - **Feature-gated skills** — `loop` (requires `AGENT_TRIGGERS`), `claude-api` (requires `BUILDING_CLAUDE_APPS`), `schedule` (requires `AGENT_TRIGGERS_REMOTE`)
+  </Card>
+</CardGroup>
+
+### Built-in skill registration details
+
+Each built-in skill is registered with a definition object containing these key fields:
+
+| Field | Purpose |
+|---|---|
+| Prompt generator | Lazily executed function that only runs when the skill is invoked |
+| `files` | Optional collection of referenced files extracted to disk on first invocation |
+| `isEnabled` | Runtime gating callback invoked on each use to check feature availability |
+| `context: 'fork'` | Marks the skill to execute in an independent subprocess |
+| `user-invocable` | Whether the skill appears as a slash command |
+
+#### Security design of file extraction
+
+Built-in skills that reference documentation or configuration files embed those files in the binary and extract them to disk on first invocation. The extraction uses hardened file operations to prevent attacks:
+
+| Security measure | Attack prevented | Mechanism |
+|---|---|---|
+| `O_NOFOLLOW` flag | Symlink hijacking | Opening fails if the path is a symbolic link |
+| `O_EXCL` flag | TOCTOU race conditions | File must not exist; ensures creation, not overwrite |
+| `0o700` directory permissions | Directory traversal | Only the owner can access the directory |
+| `0o600` file permissions | File leakage | Only the owner can read and write the file |
+| `??=` singleton pattern | Concurrent race conditions | Concurrent calls share the same extraction Promise |
+
+---
+
+## SKILL.md frontmatter format
+
+File-based skills are organized as directories: each skill is a directory named after the skill (`skill-name/`) containing a mandatory `SKILL.md` file. YAML frontmatter configures the skill; the Markdown body is the prompt.
+
+```yaml
+---
+name: my-skill-display-name
+description: This is an example skill
+when_to_use: Use when the user needs to perform a certain operation
+arguments: arg1 arg2 arg3
+argument-hint: "[arg1] [arg2] [arg3]"
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+model: claude-sonnet-4-20250514
+effort: high
+user-invocable: true
+disable-model-invocation: false
+context: fork
+agent: code-builder
+version: "1.0"
+paths:
+  - "src/**/*.ts"
+  - "lib/**/*.js"
+hooks:
+  pre:
+    - command: npm run lint
+  post:
+    - command: echo "done"
+shell: bash
+---
+
+# Skill body
+
+This is the main content of the skill. You can use $ARGUMENTS to reference
+user-input arguments, $1 and $2 for positional arguments, ${CLAUDE_SKILL_DIR}
+for the skill directory path, and ${CLAUDE_SESSION_ID} for the session ID.
+```
+
+### Required and recommended fields
+
+| Field | Type | Required | Description | Best practice |
+|---|---|---|---|---|
+| `name` | string | No | Skill display name (uses directory name when omitted) | kebab-case recommended |
+| `description` | string | **Yes** | Skill description | One concise sentence describing the function |
+| `when_to_use` | string | No | Usage scenario description | Helps the model automatically select the appropriate skill |
+| `arguments` | string | No | Argument name list, space-separated | Named arguments improve readability and substitution clarity |
+| `allowed-tools` | list | No | Tools the skill may use | Principle of least privilege — list only what is necessary |
+| `model` | string | No | Model to use | `haiku` for read-only tasks, `inherit` for complex tasks |
+| `context` | string | No | Execution context: `inline` or `fork` | Use `fork` for time-consuming tasks, `inline` for quick operations |
+| `paths` | list | No | Gitignore-style patterns for conditional activation | Used for auto-activating skills by file type |
+| `hooks` | object | No | `pre`/`post` lifecycle commands | Automated lint and test checks |
+
+---
+
+## Three-level parameter substitution
+
+Skill prompts support a flexible three-level substitution mechanism. Substitution executes in a fixed order:
+
+<Steps>
+  <Step title="Named parameter substitution">
+    When frontmatter defines `arguments: greeting name`, the variables `$greeting` and `$name` map to user input at the corresponding positions.
+
+    ```
+    Input: /my-skill hello world
+    $greeting → "hello"
+    $name     → "world"
+    ```
+  </Step>
+  <Step title="Indexed parameter substitution">
+    Positional shorthand forms are substituted next.
+
+    ```
+    $1 → "hello"    ($0 is the skill name itself)
+    $2 → "world"
+    $ARGUMENTS[0] → "hello"
+    $ARGUMENTS[1] → "world"
+    ```
+  </Step>
+  <Step title="Full argument substitution and append">
+    `$ARGUMENTS` is replaced with the full argument string. If no `$` placeholders appear anywhere in the prompt, the argument text is appended to the end of the prompt automatically.
+
+    ```
+    $ARGUMENTS → "hello world"
+    ```
+  </Step>
+</Steps>
+
+Beyond argument substitution, the prompt generator also injects two additional environment variables:
+
+- `${CLAUDE_SKILL_DIR}` — absolute path of the skill directory (useful for referencing auxiliary files)
+- `${CLAUDE_SESSION_ID}` — current session ID (useful for session-scoped state)
+
+### Shell command inline expansion
+
+Non-MCP skills support Shell command inline expansion within the prompt body. MCP skills explicitly do not execute Shell command expansion.
+
+<Warning>
+MCP skills come from external servers, and Shell commands can execute arbitrary system operations. Allowing Shell command expansion in MCP skill prompts would allow a malicious MCP server to inject `$(rm -rf /)`. This is a critical trust boundary: local skill files are created and managed by the user (trusted), while MCP skills come from the network (untrusted).
+</Warning>
+
+---
+
+## Layered skill loading
+
+Skills are discovered from five sources, loaded in parallel, and merged by priority:
+
+<Steps>
+  <Step title="Managed policy level">
+    Path: `{managedPath}/.claude/skills/`
+
+    Distributed by enterprise administrators through centralized configuration. Highest priority. Can be disabled via `CLAUDE_CODE_DISABLE_POLICY_SKILLS`.
+  </Step>
+  <Step title="User level">
+    Path: `~/.claude/skills/`
+
+    Available across all projects. Requires `userSettings` source to be enabled and not restricted by `pluginOnly` policy.
+  </Step>
+  <Step title="Project level">
+    Path: `.claude/skills/`
+
+    Only takes effect within the project context. Supports nested directory discovery via `discoverSkillDirsForPaths` — when the model operates on a file, the system walks upward from the file's directory looking for `.claude/skills/` directories, enabling per-subdirectory skill activation in monorepos.
+  </Step>
+  <Step title="Additional directories">
+    The `.claude/skills/` subdirectory within extra directories specified via the `--add-dir` CLI parameter.
+  </Step>
+  <Step title="Legacy commands directory">
+    Path: `.claude/commands/`
+
+    Compatibility loading for the old format. Both single-file `.md` and directory-format `SKILL.md` are supported. This source is tagged as `commands_DEPRECATED`.
+  </Step>
+</Steps>
+
+The deduplication strategy uses `realpath` to resolve symbolic links and obtain canonical paths, then keeps the skill from the first source encountered. This prevents duplicate loading when a skill directory is reachable through multiple paths (original path plus a symbolic link).
+
+### LoadedFrom source types and trust levels
+
+The `LoadedFrom` type tracks where a skill originated and directly influences security policy:
+
+| Source type | Trust level | Shell inline expansion |
+|---|---|---|
+| `bundled` | Highest — compiled into binary | Allowed |
+| `managed` | High — enterprise administrator | Allowed |
+| `skills` | Medium — user or project file | Allowed |
+| `plugin` | Medium — installed plugin | Allowed |
+| `commands_DEPRECATED` | Medium — legacy format | Allowed |
+| `mcp` | Low — external network server | **Prohibited** |
+
+---
+
+## Conditional skill activation
+
+Skills with a `paths` frontmatter field are not activated immediately at load time. They are stored in the `conditionalSkills` map and only activated when a file operation matches their path pattern.
+
+```yaml
+---
+description: TypeScript-specific code review
+paths:
+  - "src/**/*.ts"
+  - "src/**/*.tsx"
+---
+```
+
+<Steps>
+  <Step title="Load as conditional">
+    At startup, the skill is stored in `conditionalSkills` rather than the active skill set.
+  </Step>
+  <Step title="File operation triggers matching">
+    When the model operates on a file via `Read`, `Write`, `Edit`, etc., the system checks whether the file path matches any conditional skill's `paths` pattern using gitignore-style matching.
+  </Step>
+  <Step title="Permanent activation">
+    If the path matches, the skill is moved to the dynamic skill set and **permanently marked as activated**. Even if caches are cleared later, the skill remains active for the rest of the session.
+  </Step>
+</Steps>
+
+**Why permanent marking?** If a skill were moved back to conditional status after a cache clear, it might "disappear" mid-task while the model is executing work guided by that skill's instructions. Permanent marking ensures consistency throughout the session.
+
+<Tip>
+In monorepos, use conditional skills to give each sub-package its own context-appropriate capabilities. When the model works on `packages/frontend/` files, frontend component generation skills activate automatically; when it works on `packages/backend/` files, API generation skills activate instead.
+</Tip>
+
+---
+
+## Plugin system architecture
+
+Plugins are a higher-level extension unit than skills. A single plugin can contain multiple components — skills, agents, hooks — all sharing the same plugin discovery and loading infrastructure.
+
+### Plugin directory structure
+
+```
+my-plugin/
+├── plugin.json           # Plugin manifest (optional)
+├── commands/             # Custom slash commands (SKILL.md files)
+│   ├── build.md
+│   └── deploy.md
+├── agents/               # Custom AI agents
+│   └── test-runner.md
+└── hooks/
+    └── hooks.json        # Hook configuration
+```
+
+The `plugin.json` manifest declares metadata:
+
+| Field | Purpose |
+|---|---|
+| `name` | Plugin name for display and reference |
+| `version` | Version number for compatibility checking |
+| `description` | Human-readable description |
+| `commands` | Directory path for discovering custom commands |
+| `agents` | Directory path for discovering custom agents |
+| `hooks` | Path for hook configuration |
+
+### Plugin cache behavior
+
+Plugin loading uses a cache-first strategy to avoid redundant file system I/O:
+
+<Steps>
+  <Step title="Check cache">
+    For each plugin directory, the loader checks whether the plugin data is already in cache. Cache hits return immediately without touching disk.
+  </Step>
+  <Step title="Parse manifest and load components">
+    On a cache miss, the loader parses `plugin.json`, then loads skills from `commands/`, agents from `agents/`, and validates hook configuration — all in parallel.
+  </Step>
+  <Step title="Collect errors without aborting">
+    Errors from any single component (e.g., a malformed Markdown file) are collected into `PluginLoadResult.errors` rather than halting the load. Other components continue loading normally.
+  </Step>
+  <Step title="Store in cache">
+    The result is stored in cache and returned as `PluginLoadResult { plugins: Plugin[], errors: LoadError[] }`.
+  </Step>
+</Steps>
+
+<Info>
+The "collect errors without aborting" design is critical for plugin systems. A format error in one skill should not prevent all of a plugin's agents and hooks from loading. Users can diagnose and fix errors in `PluginLoadResult.errors` without losing the rest of the plugin's functionality.
+</Info>
+
+### MCP skill indirect registration
+
+MCP servers can provide skills. To avoid circular dependencies between the skill module and the MCP module, MCP skill registration uses a "publish-lookup" pattern through an intermediate registration module:
+
+- At initialization, the skill module **publishes** its skill build function to the registry module
+- When the MCP module needs to build a skill, it **looks up** the function from the registry
+
+This inserts a leaf node (the registry module, which has no dependencies of its own) into the dependency graph, breaking the cycle. Dynamic imports are not used because in bundled binaries, non-literal dynamic imports fail due to compile-time path resolution.
+
+---
+
+## Skills vs. tools
+
+Skills and tools are complementary but distinct:
+
+| Dimension | Skills | Tools |
+|---|---|---|
+| Definition | Markdown + YAML frontmatter | TypeScript code |
+| Purpose | Reusable prompt templates and workflow guides | Executable capabilities (file I/O, Bash, web search) |
+| Creation | Any user, no coding required | Requires code changes or MCP server |
+| Invocation | Slash commands or automatic selection | Model decision-making |
+| Extension point | Behaviors and patterns | Capabilities and integrations |
+| Security | Trust level based on source type | Permission pipeline and global filters |
+
+A skill orchestrates *how the model thinks and approaches a task*. Tools provide *the concrete operations the model executes during that task*. Skills often specify which tools are allowed via `allowed-tools`, creating a focused execution environment for each workflow.
+
+---
+
+## Creating custom skills: tutorial
+
+**Goal:** A `/gen-api GET users` command that generates a complete REST API endpoint including routing, controllers, type definitions, and tests.
+
+<Steps>
+  <Step title="Create the skill directory">
+    ```bash
+    mkdir -p ~/.claude/skills/gen-api
+    ```
+  </Step>
+  <Step title="Write SKILL.md">
+    ```yaml
+    ---
+    name: gen-api
+    description: Generate complete REST API endpoint code scaffolding
+    when_to_use: Use when creating a new API endpoint or CRUD operation
+    arguments: method resource
+    argument-hint: "[GET|POST|PUT|DELETE] [resource-name]"
+    allowed-tools:
+      - Read
+      - Write
+      - Grep
+      - Glob
+    model: inherit
+    effort: high
+    user-invocable: true
+    ---
+
+    # API endpoint generator
+
+    Create a $method REST API implementation for resource $resource.
+
+    ## Context collection
+
+    First, execute the following investigation steps:
+
+    1. Use Grep to find existing route definition patterns
+    2. Use Read to view an existing route file as reference
+    3. Use Glob to find the location of type definitions
+    4. Use Grep to find existing test file structures
+
+    ## Generation specification
+
+    Based on investigation results, generate the following files:
+
+    ### 1. Route definition
+    - Follow the pattern of existing route files
+    - Include request validation middleware
+    - Include authentication/authorization checks
+
+    ### 2. Type definitions
+    - Request body types
+    - Response types
+    - Query parameter types
+
+    ### 3. Controller logic
+    - Input validation
+    - Business logic
+    - Error handling and response formatting
+
+    ### 4. Test file
+    - Happy path tests
+    - Edge case tests
+    - Error handling tests
+
+    Follow the existing code style and patterns in the project.
+    ```
+  </Step>
+  <Step title="Test and iterate">
+    Launch Claude Code, enter `/gen-api GET users`, and verify:
+
+    - The skill is recognized and loaded
+    - `$method` resolves to `"GET"` and `$resource` resolves to `"users"`
+    - Generated code conforms to the project's existing patterns
+
+    Iterate based on feedback: if the model misses a step, add stronger instructions; if style is inconsistent, add more specific style requirements.
+  </Step>
+</Steps>
+
+### Skill composition patterns
+
+<AccordionGroup>
+  <Accordion title="Skill chain">
+    Skills can be sequenced into workflows:
+
+    ```
+    /gen-api POST orders    → Generate API skeleton
+         ↓
+    /verify                  → Verify generated code
+         ↓
+    /remember "Use RESTful route naming"  → Record project convention
+    ```
+  </Accordion>
+  <Accordion title="Conditional skills with agents">
+    A conditional skill activates on API files; a custom agent references that skill; the agent automatically uses it when handling API tasks. The skill's auxiliary files in its directory serve as reference patterns for the model.
+  </Accordion>
+  <Accordion title="Skills with lifecycle hooks">
+    ```yaml
+    hooks:
+      pre:
+        - command: npm run type-check
+      post:
+        - command: npm run test -- --related
+    ```
+
+    Run type-checking before code generation, and run related tests after completion.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+Do not create "do-everything" skills. A skill should do one thing and do it well. If a skill's prompt exceeds 200 lines, split it into multiple focused skills. Small, focused skills are easier to debug, easier to reuse, and easier to compose.
+</Warning>

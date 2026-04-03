@@ -1,122 +1,81 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Yù Yú: Decoding Agent Harness",
+  "theme": "maple",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#9f7aea"
   },
-  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/lintsinghua/claude-code-book"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/lintsinghua/claude-code-book"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Book",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Introduction",
+            "pages": ["introduction", "foreword"]
+          },
+          {
+            "group": "Part 1: Foundations",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "part1/01-new-paradigm",
+              "part1/02-dialog-loop",
+              "part1/03-tool-system",
+              "part1/04-permission-pipeline"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Part 2: Core Systems",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "part2/05-settings-configuration",
+              "part2/06-memory-system",
+              "part2/07-context-management",
+              "part2/08-hook-system"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Part 3: Advanced Patterns",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "part3/09-sub-agents-fork",
+              "part3/10-coordinator-pattern",
+              "part3/11-skill-system",
+              "part3/12-mcp-integration"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Part 4: Engineering Practice",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "part4/13-streaming-architecture",
+              "part4/14-plan-mode",
+              "part4/15-build-your-own-harness"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Appendices",
             "pages": [
-              "api-reference/introduction"
-            ]
-          },
-          {
-            "group": "Endpoint examples",
-            "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "appendix/a-architecture-map",
+              "appendix/b-tool-inventory",
+              "appendix/c-feature-flags",
+              "appendix/d-glossary"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

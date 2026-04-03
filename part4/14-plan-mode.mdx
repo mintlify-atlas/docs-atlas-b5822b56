@@ -1,0 +1,383 @@
+---
+title: "Plan Mode & Structured Workflows"
+description: "How Plan Mode separates read-only exploration from writable execution, how plan files survive crashes through a three-layer recovery strategy, and how the scheduling system powers event-driven Agent workflows."
+---
+
+> "Plans are nothing; planning is everything." — Dwight D. Eisenhower
+
+Plan Mode is one of Claude Code's most distinctive designs. It separates Agent behavior into two phases — a **read-only exploration phase** (planning) and a **writable execution phase** (implementation) — ensuring alignment before action. This chapter explains the architecture behind that separation, how plans survive session crashes, and how the scheduling system turns Agent actions into composable workflows.
+
+---
+
+## Plan Mode architecture
+
+### The "think before you act" philosophy
+
+The core problem Plan Mode solves is **Premature Action**. Without Plan Mode, an Agent faces a dilemma: when facing a complex task, either blindly act in the first round (high risk) or read code repeatedly without making decisions (inefficient).
+
+Plan Mode provides a "legitimate thinking space" — in this space, the Agent can freely explore without producing side effects, until it is confident it understands the full picture of the problem.
+
+This is analogous to architecture in construction: no architect would start laying bricks on day one. They first draw blueprints (plan), confirm design intent with the client, evaluate structural feasibility, then begin construction (execution). During the planning phase, modifying a drawing costs nothing; after construction starts, correcting a mistake is expensive.
+
+**Impact on real scenarios:**
+
+| Scenario | Without Plan Mode | With Plan Mode |
+|----------|-------------------|----------------|
+| Misunderstood requirements | Implemented wrong feature; needs rollback | Discovered misunderstanding in read-only phase; zero-cost correction |
+| Ignored existing patterns | Wrote code inconsistent with project style | Explored project first; found existing patterns before acting |
+| Wrong solution choice | Implemented poor-performing approach; needs rewrite | Compared trade-offs before committing |
+| Missed edge cases | Finished code then found gaps; rework required | Enumerated edge cases in plan; incorporated into solution |
+
+<Note>
+In actual use, Plan Mode depth should match task complexity. For simple single-file modifications, direct execution is often more efficient than entering Plan Mode. Claude Code's prompt design reflects this judgment — Plan Mode is suggested only for "implementation tasks," not for simple queries or minor edits.
+</Note>
+
+### Mode switching mechanism
+
+After the user approves entering Plan Mode, `EnterPlanModeTool`'s `call` method executes mode switching:
+
+1. **Guard against sub-agent context** — if running inside a sub-agent, throw an error. Sub-agents must not enter Plan Mode: they would wait for user plan approval, but the user may not know the sub-agent exists, blocking the entire parent Agent's execution on an approval request users cannot understand.
+2. **Save original mode** to `prePlanMode` for restoration later.
+3. **Run `prepareContextForPlanMode`** — activates classifier side effects and ensures correct permission configuration.
+4. **Switch permission context** to plan mode configuration.
+5. **Return behavior instructions** to the Agent.
+
+**The six behavior instructions given to the Agent upon entering Plan Mode:**
+
+<Steps>
+  <Step title="Explore the codebase">
+    Thoroughly examine existing patterns, conventions, and relevant files using read-only tools (Read, Grep, Glob).
+  </Step>
+  <Step title="Identify similar features">
+    Find existing architectural approaches and implementations that relate to the task.
+  </Step>
+  <Step title="Consider multiple approaches">
+    Analyze trade-offs between different implementation strategies before committing to one.
+  </Step>
+  <Step title="Clarify through questions">
+    Use `AskUserQuestion` if the intended approach needs confirmation before investing in a plan.
+  </Step>
+  <Step title="Design a concrete implementation strategy">
+    Converge on a specific plan with enumerated steps, affected files, and risk assessment.
+  </Step>
+  <Step title="Present the plan via ExitPlanMode">
+    Exit planning mode to surface the plan for user approval before any write operations begin.
+  </Step>
+</Steps>
+
+These six steps encode a cognitive model: **Understand → Discover → Compare → Clarify → Design → Present**. Steps 1–2 are divergent (broad exploration); steps 3–4 are transitional (focusing but still open); steps 5–6 are convergent (definite implementation plan).
+
+**External vs internal users.** `EnterPlanModeTool`'s prompt system provides different guidance based on user type. For external users, the system encourages Plan Mode for implementation tasks. For internal Anthropic users, the system is more restrained, suggesting starting work directly and clarifying through questions — valuing efficiency over the extra alignment step.
+
+### Exiting Plan Mode
+
+`ExitPlanModeV2Tool` handles restoration to the original permission mode. Its design is more complex than `EnterPlanMode` because it must handle several edge cases.
+
+**Mode restoration with circuit breaker defense.** The system reads the saved `prePlanMode` value and restores it — with a key safeguard: if `prePlanMode` is `auto`, but auto mode's gate is currently closed (for example, because a circuit breaker triggered during the planning phase), the system falls back to `default` mode rather than restoring `auto`.
+
+This defends against a subtle time-window issue: when entering Plan Mode, auto mode was enabled. During the planning phase (potentially minutes or tens of minutes), auto mode may have been closed by an external policy change. If `ExitPlanMode` doesn't check this condition, the Agent would exit Plan Mode with full auto-mode permissions, potentially bypassing newly activated security limits.
+
+**Teammate path.** When an Agent runs as a teammate and Plan Mode is mandatory, `ExitPlanMode` doesn't pop up a local approval UI. Instead, it sends the plan to the team lead via the mailbox mechanism. The approval request contains sender, timestamp, plan file path, plan content, and request ID.
+
+### Complete case: from requirement to plan to implementation
+
+**User requirement:** "Add pagination support for the project's REST API."
+
+**Step 1 — Enter Plan Mode.** The Agent judges this a non-trivial task involving multiple file modifications and proactively triggers `EnterPlanMode`. System saves current mode as `default`, switches to plan mode.
+
+**Step 2 — Read-only exploration.** All tool calls are read-only:
+
+```
+1. Glob("src/routes/*.ts")           — Discover all route files
+2. Glob("src/models/*.ts")           — Discover all model files
+3. Grep("limit|offset|page|cursor")  — Search for existing pagination implementations
+4. Read("src/routes/users.ts")       — Read a typical route implementation
+5. Read("src/middleware/validate.ts") — Understand validation middleware patterns
+6. Grep("interface.*Response")       — Search response type definitions
+```
+
+**Step 3 — Trade-off analysis.**
+
+| Dimension | Offset pagination | Cursor pagination |
+|-----------|-------------------|-------------------|
+| Implementation complexity | Low | Medium |
+| Large dataset performance | Poor (OFFSET scan) | Excellent (index lookup) |
+| Data consistency | Medium | Excellent (cursor-based) |
+| Client compatibility | Good (intuitive page numbers) | Needs adaptation |
+| Prisma integration | Simple (skip/take) | Needs cursor encoding |
+
+**Step 4 — Present plan via ExitPlanMode:**
+
+```markdown
+## Pagination Feature Implementation Plan
+
+### Solution: Hybrid mode
+- Default: offset pagination (simple, good compatibility)
+- Optional: cursor pagination for high-frequency endpoints
+
+### Implementation steps
+1. Create src/types/pagination.ts — Pagination type definitions
+2. Create src/middleware/pagination.ts — Pagination parameter parsing
+3. Modify src/routes/users.ts — First implementation example
+4. Add Zod schema validation — limit (1-100), offset (>=0)
+5. Update ApiResponse type — Add pagination metadata
+
+### Expected impact
+- New files: 2 | Modified files: 3
+- Risk: Low (purely incremental, no existing functionality modified)
+```
+
+**Step 5 — Approval and execution.** After user approves, `ExitPlanMode` restores the original permission mode and the Agent enters the execution phase.
+
+---
+
+## Plan file persistence and recovery
+
+### The core challenge: plans cannot be lost
+
+Users spent time approving plans; Agents spent tokens generating them. If plans are lost due to session crash or unexpected interruption, all investment is wasted.
+
+**File path generation** uses slug-based naming. Main sessions use `{slug}.md`; sub-agents use `{slug}-agent-{agentId}.md` to avoid conflicts. Slugs are generated lazily — on first access — and retry up to 10 times if the generated path already exists.
+
+### Three-layer recovery strategy
+
+`copyPlanForResume` attempts to recover a plan from three sources when resuming a session, tried in priority order:
+
+<Steps>
+  <Step title="Direct read of plan file">
+    The simplest path. If the local file exists, return it directly.
+
+    **Coverage:** Local file intact, session restarted normally.
+  </Step>
+  <Step title="File snapshot recovery">
+    Recover from `file_snapshot` system messages embedded in the session transcript via `findFileSnapshotEntry`.
+
+    **Coverage:** Remote sessions (CCR) where local files don't persist between sessions.
+  </Step>
+  <Step title="Message history recovery">
+    Extract plan content from one of three message formats:
+
+    - **`ExitPlanMode`'s `tool_use` input** — plan content injected via `normalizeToolInput`. Most reliable: tool_use messages are part of the API protocol and are not modified by normal context management operations.
+    - **User message's `planContent` field** — set during the clear-context flow. Preserves the plan's "seed" after context is cleared, so the newly started execution phase still knows what to do.
+    - **Attachment message's `plan_file_reference`** — preserved during auto-compact. Even after automatic context compression, the plan file can be located through this reference.
+
+    **Coverage:** All scenarios where the file itself is gone but the conversation history survives.
+  </Step>
+</Steps>
+
+<Info>
+Three recovery sources, three different failure scenarios. This is "don't put all eggs in one basket" defensive design: each layer covers what the others miss. Recovery logic attempts them in reliability order — the first successful source wins.
+</Info>
+
+**Fork recovery** uses a completely different strategy. `copyPlanForFork` generates a new slug for the forked session and copies the original plan file to a new path. This prevents parent and fork from overwriting each other's plan files. After forking, two sessions may go down completely different execution paths — they need independent plan copies.
+
+### Plan verification
+
+`registerPlanVerificationHook` sets up an independent verification agent that runs after context is cleared and implementation begins. The hook must be registered after context clear because context clear removes all hooks.
+
+**Why an independent verification agent?** Executioners judge their own work using their own understanding rather than strictly comparing against the original plan text. An independent verification agent holds a snapshot of the original plan file and can review implementation results from a "bystander" perspective — the same reason you don't author-review your own pull request.
+
+The verification agent compares implementation results item by item and outputs a report: compliant items, deviation items, and missing items.
+
+---
+
+## Workflow system
+
+### The extensibility ladder
+
+Claude Code's workflow capabilities are provided primarily by the Skill system — predefined prompt templates triggerable via slash commands. Skill execution handles three things: replacing `$ARGUMENTS` with user-provided arguments, extending allowed tools via `createGetAppStateWithAllowedTools`, and selecting the appropriate agent type.
+
+<CardGroup cols={2}>
+  <Card title="Skill system" icon="file-text">
+    **Barrier: Low | Flexibility: Medium**
+
+    Prompt templates in natural language. Anyone can define workflows without understanding internal APIs. Best for most users.
+  </Card>
+  <Card title="Hook system" icon="terminal">
+    **Barrier: Medium | Flexibility: High**
+
+    Arbitrary Shell commands at lifecycle extension points. Requires programming ability. Best for advanced automation.
+  </Card>
+  <Card title="MCP servers" icon="server">
+    **Barrier: High | Flexibility: Extreme**
+
+    Independent processes in any language communicating via the MCP protocol. Best for enterprise tool integration.
+  </Card>
+  <Card title="Choosing the right level" icon="layers">
+    Start with the simplest extension mechanism for your use case. As requirement complexity grows, move up the ladder. Most users only need Skills; advanced users need Hooks; enterprise users integrate via MCP.
+  </Card>
+</CardGroup>
+
+### Fork Agent state isolation
+
+`createSubagentContext` creates a completely isolated `ToolUseContext` for sub-agents. By default, all mutable state is sandboxed:
+
+| State | Behavior |
+|-------|----------|
+| `readFileState` | Cloned from parent context |
+| `abortController` | New child controller linked to parent (parent abort propagates; child abort does not propagate up) |
+| `setAppState` | No-op by default, unless `shareSetAppState` is explicitly set |
+| UI callbacks (`addNotification`, `setToolJSX`, etc.) | All `undefined` |
+
+**Why can't sub-agents control the parent UI?** Critical safety design. If sub-agents could pop notifications or modify UI, users would be overwhelmed by output from multiple sub-agents. More seriously, malicious tool output via prompt injection could exploit sub-agent UI capabilities for phishing — for example, popping a seemingly legitimate confirmation dialog.
+
+Sub-agents run in a sandbox: they can see the outside world (through cloned file state), but cannot affect it (cannot modify parent Agent state, cannot control UI). The only communication channel with the outside world is `tool_result` messages.
+
+<Tip>
+Follow the principle of least privilege when designing sub-agents. Pass only the minimum context the sub-agent needs to complete its task. This improves security and reduces token consumption — sub-agent input tokens count toward cost.
+</Tip>
+
+---
+
+## Scheduling system
+
+### Local scheduled tasks: ScheduleCronTool
+
+Claude Code's scheduling system supports two task types:
+
+<Tabs>
+  <Tab title="One-shot tasks">
+    `recurring: false` — triggers once then automatically deletes.
+
+    Best for: "Check deploy status in 30 minutes," "Alert if this job hasn't completed by midnight."
+
+    One-shot tasks use reverse jitter (trigger slightly early), controlled by `oneShotMinuteMod` (default: 30, meaning only `:00` and `:30` exact triggers add jitter).
+  </Tab>
+  <Tab title="Recurring tasks">
+    `recurring: true` — repeats according to a cron schedule, rescheduling from current time after each trigger.
+
+    Best for: "Check error logs every hour," "Generate status report every morning."
+
+    Recurring tasks auto-expire after 7 days (`recurringMaxAgeMs`) by default, preventing zombie tasks from consuming resources indefinitely. Tasks with the `permanent` flag are exempt.
+  </Tab>
+</Tabs>
+
+Tasks are stored in `<project>/.claude/scheduled_tasks.json`:
+
+```json
+{
+  "tasks": [
+    {
+      "id": "a1b2c3d4",
+      "cron": "0 * * * *",
+      "prompt": "check the deploy status",
+      "createdAt": 1710000000000,
+      "recurring": true
+    }
+  ]
+}
+```
+
+**The `durable` flag.** Each `CronTask` has a `durable` runtime flag. Tasks with `durable: false` exist only in process memory and disappear when the session ends. Tasks written to disk have this flag stripped. Use `durable: false` for tasks that only serve the current session (polling during an active debugging session); use `durable: true` for tasks that need to survive session restarts.
+
+### CronScheduler internals
+
+**File locking.** `tryAcquireSchedulerLock` ensures multiple Claude sessions in the same project directory don't repeatedly trigger the same on-disk task. Non-owner sessions probe the lock every 5 seconds and take over if the owner crashes. Without this, opening multiple terminal windows each running Claude Code would trigger every scheduled task once per window.
+
+**Jitter mechanism.** To avoid massive sessions triggering inference requests at the same moment (the Thundering Herd problem), recurring tasks add a deterministic positive delay proportional to the trigger interval. For hourly tasks, actual trigger time disperses randomly within `:00` to `:06`. This smooths peak API load into uniform load.
+
+**Missed task detection.** At startup, the scheduler checks whether any task's next trigger time has passed and notifies the user if so.
+
+### Remote triggering: RemoteTriggerTool
+
+`RemoteTriggerTool` provides remote Agent trigger management through Anthropic API's triggers endpoint. It supports five operations: `list`, `get`, `create`, `update`, `run`.
+
+Enablement requires both feature flag `tengu_surreal_dali` and policy limit `allow_remote_sessions` to be satisfied.
+
+**Remote trigger application scenarios:**
+
+<CardGroup cols={2}>
+  <Card title="CI/CD integration" icon="circle-check">
+    When a CI pipeline fails, automatically trigger an Agent to analyze the failure and generate fix suggestions.
+  </Card>
+  <Card title="Monitoring alert response" icon="bell">
+    When monitoring detects abnormal metrics, trigger an Agent for root cause analysis.
+  </Card>
+  <Card title="Code repository events" icon="code-branch">
+    When a PR is created or updated, trigger an Agent for automatic code review.
+  </Card>
+  <Card title="Scheduled reports" icon="chart-bar">
+    Periodically trigger an Agent to generate project status reports or health summaries.
+  </Card>
+</CardGroup>
+
+<Tip>
+Combining remote triggers with Plan Mode builds powerful automation workflows. When CI fails, trigger an Agent that automatically enters Plan Mode to analyze failure causes, generates a fix plan, then automatically executes the fix. This "trigger → plan → execute" pattern is the core paradigm of Agent-driven automation.
+</Tip>
+
+---
+
+## Workflow design patterns and anti-patterns
+
+### Patterns to follow
+
+<AccordionGroup>
+  <Accordion title="Pattern 1: Plan-Execute-Verify cycle">
+    The most classic Agent workflow pattern. Plan phase ensures correct direction, Execute phase implements efficiently, Verify phase guarantees quality. Separating the three phases lets each be independently optimized and debugged.
+
+    ```
+    Plan (read-only exploration)
+        ↓
+    Execute (implement according to plan)
+        ↓
+    Verify (independent verification)
+        ↓ Pass        ↓ Fail
+      Done        ← back to Plan
+    ```
+  </Accordion>
+  <Accordion title="Pattern 2: Event-triggered workflow">
+    An external event triggers an Agent that enters Plan Mode, surfaces the plan for user approval, then executes and reports results. Applicable to operations automation and CI/CD integration scenarios. Event-triggered rather than user-initiated; Plan Mode ensures automated operations remain safe and controllable.
+  </Accordion>
+  <Accordion title="Pattern 3: Polling loop with escalation">
+    A scheduled task polls at low cost. Only when an anomaly is detected does it escalate to high-cost Agent reasoning (entering Plan Mode). Applicable to continuous monitoring scenarios — keeps routine overhead minimal while still catching problems.
+  </Accordion>
+</AccordionGroup>
+
+### Anti-patterns to avoid
+
+<AccordionGroup>
+  <Accordion title="Anti-pattern 1: Unplanned complex tasks" defaultOpen={false}>
+    Directly asking an Agent to execute complex tasks involving multiple file modifications without Plan Mode.
+
+    **Risk:** Directional errors causing large-scale rework. The cost of correcting a misunderstood requirement after implementation is dramatically higher than correcting it during planning.
+  </Accordion>
+  <Accordion title="Anti-pattern 2: Over-planning" defaultOpen={false}>
+    Entering Plan Mode even for simple tasks like modifying a configuration value.
+
+    **Risk:** Wasted time and tokens, degraded user experience. Match planning depth to task complexity.
+  </Accordion>
+  <Accordion title="Anti-pattern 3: Never cleaning up scheduled tasks" defaultOpen={false}>
+    Creating recurring tasks without setting reasonable expiration times.
+
+    **Risk:** Zombie tasks continuously consuming resources. Each trigger produces an API call, consumes tokens, and occupies scheduler memory. Claude Code's default 7-day expiration reflects empirical evidence: if a recurring task runs continuously for 7 days unnoticed, it's likely no longer needed.
+  </Accordion>
+  <Accordion title="Anti-pattern 4: Synchronously waiting for polling results" defaultOpen={false}>
+    Blocking the main conversation with `Sleep + polling` to wait for scheduled task results.
+
+    **Correct approach:** Push results asynchronously through a notification mechanism. The main conversation should not be blocked.
+  </Accordion>
+  <Accordion title="Anti-pattern 5: SleepTool in Plan Mode" defaultOpen={false}>
+    Using `SleepTool` during the planning phase.
+
+    **Reason:** Plan Mode should be efficient read-only exploration. If an operation during planning requires waiting, the exploration strategy needs optimization — acquire all needed information at once rather than poll and wait.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key takeaways
+
+<CardGroup cols={2}>
+  <Card title="Separation of read-only and writable phases" icon="shield-check">
+    Plan Mode separates exploration (no side effects) from execution (writes permitted). EnterPlanMode saves original mode; ExitPlanMode restores it with circuit breaker defense to prevent bypassing newly activated security limits.
+  </Card>
+  <Card title="Three-layer plan recovery" icon="rotate-ccw">
+    Plans survive crashes via: direct file read → file snapshot → message history (tool_use input, planContent field, plan_file_reference). Each layer covers different failure scenarios — "don't put all eggs in one basket."
+  </Card>
+  <Card title="Fork state isolation" icon="code-fork">
+    Sub-agents run in a sandbox: cloned file state (can read), no-op setAppState, no UI callbacks (cannot modify parent). The only output channel is structured tool_result messages back to the parent Agent.
+  </Card>
+  <Card title="Robust scheduling primitives" icon="clock">
+    File locks prevent multi-session duplicate triggering; jitter prevents thundering herd; auto-expiration prevents zombie tasks; durable flags distinguish session-scoped from persistent tasks.
+  </Card>
+</CardGroup>

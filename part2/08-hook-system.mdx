@@ -1,0 +1,556 @@
+---
+title: "The Hook System — Agent's Lifecycle Extension Points"
+description: "How Claude Code's hook system provides fine-grained extension points across 26 lifecycle events, enabling logging, approval flows, context injection, and custom behavior through five hook types and a structured JSON response protocol."
+---
+
+If the permission pipeline is the agent's "guardrails," the hook system is its "nervous system." The permission pipeline determines whether the agent **can** execute an operation; the hook system determines what happens **before and after** execution. It provides fine-grained extension points for the agent's entire lifecycle — from session startup to tool invocation, from user input to context compression, every critical node can be observed, intercepted, and enhanced.
+
+From an engineering perspective, the hook system follows the classic **Observer Pattern** combined with the **Chain of Responsibility Pattern**. Each lifecycle event is a signal; multiple hooks can listen to the same signal, processing in priority order; any hook can choose to block signal propagation. This enables Claude Code's core execution engine to operate without knowledge of extension logic, achieving complete decoupling between the core system and user-defined behavior.
+
+## Hook types and execution model
+
+### The five hook types
+
+Claude Code defines four persistable hook types plus `FunctionHook` (runtime-only), making five total.
+
+<CardGroup cols={2}>
+  <Card title="Command Hook" icon="terminal">
+    Executes shell commands. Supports choosing shell interpreter (bash/powershell), custom timeout, custom status message, and a `once` flag for automatic removal after first execution. The most common hook type.
+
+    **Best for:** Script checks, filesystem operations, calling external CLI tools, conditional approval or rejection.
+  </Card>
+  <Card title="Prompt Hook" icon="message-square">
+    Calls the LLM to evaluate hook input and outputs a JSON response. Supports specifying a model and the `$ARGUMENTS` placeholder to reference hook input.
+
+    **Best for:** Approval flows requiring "intelligent judgment" — where LLM semantic understanding is needed rather than hardcoded regex rules.
+  </Card>
+  <Card title="Agent Hook" icon="cpu">
+    Agentic validator hook. Similar to Prompt hook but designed for validation scenarios requiring multi-step reasoning — such as verifying whether unit tests pass, which may need to run tests, read results, and analyze coverage before deciding.
+
+    **Best for:** Complex approval flows requiring multi-step, iterable validation.
+  </Card>
+  <Card title="HTTP Hook" icon="globe">
+    POSTs hook input JSON to a specified URL. Supports custom request headers and environment variable interpolation controlled through an `allowedEnvVars` whitelist.
+
+    **Best for:** CI/CD integration (Jenkins, GitHub Actions), audit logs to SIEM systems, enterprise internal approval services.
+  </Card>
+  <Card title="Function Hook" icon="code">
+    In-memory hooks that exist only at runtime, executing TypeScript callback functions. Cannot be persisted to configuration files — lifecycle is bound to the session.
+
+    **Best for:** Deep interaction with Claude Code runtime state, dynamic behavior control in SDK embedding mode.
+  </Card>
+</CardGroup>
+
+<Note>
+Function hooks cannot be persisted because TypeScript callback functions are in-memory executable code references that cannot be serialized to JSON. This is the boundary between "configuration as code" and "code as configuration" — the first four types are declarative configuration; Function hooks are imperative code.
+</Note>
+
+### Sync vs. async execution modes
+
+Command hooks support three execution modes:
+
+<Tabs>
+  <Tab title="Synchronous (default)">
+    Blocks the current operation and waits for hook completion before deciding whether to continue. The most common and safest mode.
+
+    **Use when:** You need to approve or reject an operation before it executes (e.g., security checks, compliance approval).
+  </Tab>
+  <Tab title="Asynchronous (async: true)">
+    Runs in the background without blocking the current operation. Hook results are not visible to the model.
+
+    **Use when:** You need "fire-and-forget" logging or notifications where the outcome does not affect the agent's behavior.
+  </Tab>
+  <Tab title="Async-rewake (asyncRewake: true)">
+    Runs in the background, but when the hook exits with code 2, injects an error message to wake the model for continued conversation. This implies the `async` attribute.
+
+    **Use when:** Long-running monitoring tasks — normal operation should not disturb the agent, but detected anomalies should trigger intervention.
+  </Tab>
+</Tabs>
+
+### Hook execution flow
+
+```
+Lifecycle event fires
+  → Collect all matching hooks
+  → Security gate check (three layers)
+  → Sort by priority
+  → Execute hooks in order
+    → If any hook returns decision: "block" → operation blocked
+    → Otherwise → continue normal flow
+```
+
+## The 26 lifecycle events
+
+The SDK defines 26 lifecycle events covering all critical nodes: tool invocation, user interaction, session management, sub-agents, compression, permissions, configuration changes, and more.
+
+### Tool call lifecycle
+
+Tool call events form a "sandwich" structure: `PreToolUse` intercepts before execution, `PostToolUse` handles after success, `PostToolUseFailure` catches after failure.
+
+<AccordionGroup>
+  <Accordion title="PreToolUse — before tool execution">
+    **The most important interception point.** Input is the tool call's parameter JSON. Hooks can block tool execution by returning `decision: "block"`, or modify the tool's actual input parameters through `updatedInput`.
+
+    Exit code semantics:
+    - **Exit 0:** stdout/stderr not shown to model (silent pass)
+    - **Exit 2:** Show stderr to model and block tool call (active block)
+    - **Other non-zero:** Show stderr to user but do not block (warning mode)
+
+    `PreToolUse` hooks fire *after* the permission pipeline. The pipeline determines "whether the tool is allowed to execute"; `PreToolUse` hooks determine "given allowed execution, whether to attach conditions or modify parameters." Even if the permission pipeline passes, a `PreToolUse` hook can still veto.
+
+    **Typical use cases:** Security auditing before dangerous operations; auto-adding safety prefixes to Bash commands; verifying the current environment before deployments; requiring additional approval for production operations.
+
+    ```json
+    {
+      "hooks": {
+        "PreToolUse": [{
+          "matcher": "Write",
+          "hooks": [{
+            "type": "command",
+            "command": "echo $INPUT_JSON | python3 -c \"import sys,json; d=json.load(sys.stdin); exit(2) if 'prod' in d.get('file_path','') else exit(0)\"",
+            "message": "Checking production file protection..."
+          }]
+        }]
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="PostToolUse — after tool execution">
+    Input contains tool call parameters and response. Supports `updatedMCPToolOutput` to override MCP tool output.
+
+    **Typical use cases:** Audit trails to external systems; appending notes or warnings after tool output; Slack/email notifications after specific tool calls; sanitizing MCP tool return values.
+
+    **Best practice:** Use async mode (`async: true`) unless you need to override MCP tool output. The tool has already finished executing, so hook results usually do not need to affect subsequent flow.
+  </Accordion>
+  <Accordion title="PostToolUseFailure — after tool execution failure">
+    Triggered when tool execution fails due to error, interruption, or timeout. Input includes `error`, `error_type`, `is_interrupt`, and `is_timeout` fields.
+
+    **Typical use cases:** Reporting tool failure info to monitoring systems (Sentry, etc.); generating retry strategies based on error type; collecting failure scene info for post-analysis; automatically switching to a backup plan when critical tools fail.
+  </Accordion>
+</AccordionGroup>
+
+### User interaction lifecycle
+
+<AccordionGroup>
+  <Accordion title="UserPromptSubmit — when user submits a prompt">
+    Triggered after the user submits a message, before model processing. Exit code 2 can completely block message processing and erase the original prompt.
+
+    This event is the translation layer between "user intent" and "model understanding." You can provide additional information to the model without the user knowing, or block message sending under specific conditions.
+
+    **Typical use cases:** Sensitive information filtering; auto-attaching relevant project documentation; expanding brief questions into more complete prompts; enforcing usage limits when quota is exceeded.
+
+    ```json
+    {
+      "hooks": {
+        "UserPromptSubmit": [{
+          "hooks": [{
+            "type": "command",
+            "command": "echo '{\"additionalContext\": \"Current git branch: '$(git branch --show-current)'. Recent commits: '$(git log --oneline -3)'\"}'",
+            "message": "Attaching git context..."
+          }]
+        }]
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="Notification — when a system notification is sent">
+    Triggered when the system sends a notification. Types include `permission_prompt`, `idle_prompt`, `auth_success`, and others.
+
+    **Typical use cases:** Integration with external notification systems (Slack, Teams); sending reminders when the agent needs user intervention.
+  </Accordion>
+</AccordionGroup>
+
+### Session lifecycle
+
+<AccordionGroup>
+  <Accordion title="SessionStart — when a session begins">
+    Triggered at session start. Sources include `startup` (new start), `resume` (resume session), `clear` (clear reset), `compact` (restart after compression). Hook stdout is shown to Claude. Blocking errors are ignored — session start hooks should not block session startup.
+
+    **Why are blocking errors ignored?** Session startup is the system initialization process. If hooks were allowed to block it, one misconfigured hook could make the entire system unstartable — a violation of the "graceful degradation" principle.
+
+    ```json
+    {
+      "hooks": {
+        "SessionStart": [{
+          "hooks": [{
+            "type": "command",
+            "command": "echo 'Project: '$(basename $(pwd))', Branch: '$(git branch --show-current)', Status: '$(git status --short | head -5)",
+            "message": "Loading project context..."
+          }]
+        }]
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="SessionEnd — when a session ends">
+    Triggered when the session ends. Reasons include `clear`, `logout`, `prompt_input_exit`, and `other`. SessionEnd hooks have a separate 1,500ms timeout because they run during the shutdown process.
+
+    **Best practice:** Keep SessionEnd hooks as lightweight as possible. Any operation exceeding 1,500ms will be forcibly terminated. For time-consuming operations, trigger a background process rather than waiting for completion.
+
+    **Typical use cases:** Deleting temporary files; saving session records to project logs; reporting session duration and operation statistics.
+  </Accordion>
+  <Accordion title="Stop — before the assistant response ends">
+    Triggered just before Claude is about to end its response. Exit code 2 injects stderr to the model and forces continued conversation.
+
+    LLMs sometimes stop generating before a task is fully complete (due to token limits or "feeling the answer is sufficient"). `Stop` hooks give you a chance to force the model to continue.
+
+    ```json
+    {
+      "hooks": {
+        "Stop": [{
+          "hooks": [{
+            "type": "command",
+            "command": "if echo \"$CLAUDE_OUTPUT\" | grep -q '```'; then exit 0; else echo 'Please include code examples in your response.' >&2; exit 2; fi",
+            "message": "Checking response completeness..."
+          }]
+        }]
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="StopFailure — when ending due to API error">
+    Triggered when the turn ends due to an API error (rate limiting, auth failure, etc.), replacing the `Stop` event. This is a fire-and-forget event — hook output and exit codes are ignored.
+
+    **Typical use cases:** Automatic reporting and diagnostic logging of API errors.
+  </Accordion>
+</AccordionGroup>
+
+### Sub-agent lifecycle
+
+<AccordionGroup>
+  <Accordion title="SubagentStart / SubagentStop">
+    Triggered when a sub-agent (Agent tool call) starts and ends. Input contains `agent_id` and `agent_type`. `SubagentStart` stdout is shown to the sub-agent; `SubagentStop` exit code 2 can let the sub-agent continue running.
+
+    **Typical use cases:** Recording which subtasks were delegated to sub-agents; injecting resource usage constraints at sub-agent start; validating sub-agent output quality after completion; monitoring long-running sub-agents.
+  </Accordion>
+</AccordionGroup>
+
+### Compression lifecycle
+
+<AccordionGroup>
+  <Accordion title="PreCompact / PostCompact">
+    `PreCompact` fires before compression. Its stdout is attached as custom compression instructions to the compression prompt, allowing you to customize summarization behavior. Exit code 2 blocks compression. `PostCompact` receives the compression summary as input.
+
+    **Why allow hooks to customize compression instructions?** Different projects have different definitions of "important information." In an API project, interface definitions are critical; in a frontend project, component hierarchy and state management are critical. `PreCompact` hooks let you customize compression strategies per project.
+
+    **Typical use cases:** Specifying which code regions must be preserved during compression; blocking compression during active debugging sessions; checking whether the summary lost critical information; defining different summary formats for different project types.
+  </Accordion>
+</AccordionGroup>
+
+### Permission and security events
+
+<AccordionGroup>
+  <Accordion title="PermissionRequest">
+    Triggered when a permission dialog displays. A hook returning `decision` can allow or deny automatically, enabling automated permission approval flows without user interaction.
+
+    This event fires at the second stage of the permission pipeline — before users see permission dialogs.
+  </Accordion>
+  <Accordion title="PermissionDenied">
+    Triggered when the auto-mode classifier rejects a tool call. A hook can suggest retry or provide alternatives — implementing "soft rejection" strategies that guide the model to use safer approaches.
+  </Accordion>
+</AccordionGroup>
+
+### Other events
+
+<AccordionGroup>
+  <Accordion title="Setup, ConfigChange, Elicitation, CwdChanged, FileChanged, InstructionsLoaded">
+    | Event | When it fires | Blockable | Use |
+    |---|---|---|---|
+    | `Setup` | Repository initialization | No | Environment checks, dependency installation |
+    | `ConfigChange` | Configuration file changes | Yes | Security audit — prevent malicious config modification |
+    | `Elicitation` | MCP server requests user input | No | MCP interactive authentication monitoring |
+    | `ElicitationResult` | MCP input completed | No | MCP result monitoring |
+    | `CwdChanged` | Working directory changes | No | Filesystem monitoring, cache refresh |
+    | `FileChanged` | File changes | No | Filesystem monitoring, cache refresh |
+    | `InstructionsLoaded` | Instruction files loaded | No | Auditing what instructions the system loaded |
+  </Accordion>
+</AccordionGroup>
+
+### Complete event reference
+
+| Event | Category | Blockable | Core use |
+|---|---|---|---|
+| `PreToolUse` | Tool call | Yes | Intercept / modify tool input |
+| `PostToolUse` | Tool call | No | Audit / post-process tool output |
+| `PostToolUseFailure` | Tool call | No | Failure diagnosis / reporting |
+| `UserPromptSubmit` | User interaction | Yes | Modify / block user message |
+| `Notification` | User interaction | No | Notification integration |
+| `SessionStart` | Session | No* | Environment initialization / context injection |
+| `SessionEnd` | Session | No | Cleanup / summary |
+| `Stop` | Session | Yes | Force continue / quality check |
+| `StopFailure` | Session | No | Error reporting |
+| `SubagentStart` | Sub-agent | No | Sub-agent monitoring |
+| `SubagentStop` | Sub-agent | Yes | Result validation |
+| `PreCompact` | Compression | Yes | Custom compression strategy |
+| `PostCompact` | Compression | No | Compression quality check |
+| `PermissionRequest` | Permission | Yes | Auto permission approval |
+| `PermissionDenied` | Permission | No | Alternative suggestion |
+| `Setup` | Initialization | No | Environment preparation |
+| `ConfigChange` | Configuration | Yes | Config change audit |
+| `Elicitation` | MCP | No | MCP input monitoring |
+| `ElicitationResult` | MCP | No | MCP result monitoring |
+| `CwdChanged` | Environment | No | Directory change notification |
+| `FileChanged` | Environment | No | File change notification |
+| `InstructionsLoaded` | Instructions | No | Instruction loading audit |
+
+\* `SessionStart` blocking is ignored (graceful degradation design).
+
+## Hook response protocol
+
+Hook output is not just stdout text, but a structured JSON response protocol. Understanding this protocol is the foundation for designing advanced hooks.
+
+**Why structured JSON instead of plain text?** Hooks need precise control over Claude Code's behavior — not just "say something," but clearly specify "allow or block," "modify input or inject context." Plain text cannot express this structured intent. The design keeps stdout as an unstructured channel (for logging and debugging) while JSON serves as the structured control channel.
+
+### Response fields
+
+<CardGroup cols={2}>
+  <Card title="decision" icon="check-circle">
+    `"approve"` or `"block"`. When `block` is returned, the `reason` field value is shown as the block reason.
+
+    Default behavior (no `decision` field or invalid JSON): continue execution. A malformed hook output will not accidentally block normal operations.
+  </Card>
+  <Card title="additionalContext" icon="plus-circle">
+    Injects hook-generated information into the model context as system reminder messages. Supported by multiple events including `SessionStart`, `PostToolUse`, `UserPromptSubmit`, and `Setup`.
+  </Card>
+  <Card title="continue" icon="skip-forward">
+    Controls whether the assistant should continue responding. When `false`, the assistant stops generating. `stopReason` provides the stop reason.
+  </Card>
+  <Card title="hookSpecificOutput" icon="settings">
+    Event-specific structured response, identified by `hookEventName`. Contains fields like `updatedInput` (for `PreToolUse`) and `additionalContext` (for `UserPromptSubmit`).
+  </Card>
+</CardGroup>
+
+### PreToolUse specific fields
+
+- **`permissionDecision`** — Override permission decision: `allow`, `deny`, or `ask`
+- **`permissionDecisionReason`** — Explanation for the decision
+- **`updatedInput`** — Runtime modification of tool input parameters
+
+<Warning>
+`updatedInput` is a double-edged sword. Used well, it enhances security without modifying user operations (e.g., auto-adding `--dry-run` flags). Abused, it breaks user expectations (e.g., silently modifying file paths to wrong locations). Follow the transparency principle — modifications should be predictable, documented, and visible to users.
+</Warning>
+
+### Exit codes and JSON response: collaboration
+
+Hook behavior is jointly controlled by two dimensions: **exit code** (process level) and **JSON response** (content level).
+
+| Exit code | JSON decision | Final effect |
+|---|---|---|
+| 0 | `approve` or none | Normal pass |
+| 0 | `block` | Block (JSON takes priority) |
+| 2 | Any | Block, stderr shown to model |
+| Other non-0 | `approve` | Warning but continue |
+| Other non-0 | `block` | Block |
+
+<Warning>
+Do not use exit codes and JSON decision to express contradictory intents (e.g., exit code 0 but `decision: "block"`, or exit code 2 but `decision: "approve"`). Although the system has clear processing priority, contradictory signals confuse maintainers and increase debugging difficulty.
+</Warning>
+
+## Hook configuration and priority
+
+### Complete configuration structure
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/check_bash_safety.py",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Check if this file write is safe. $ARGUMENTS"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat .claude/context.md 2>/dev/null || echo 'No project context file found'",
+            "message": "Loading project context..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/check_task_completion.py",
+            "asyncRewake": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Six-layer priority system
+
+Hooks are collected from multiple configuration sources and sorted by priority before execution:
+
+| Priority | Source | Location |
+|---|---|---|
+| 1 (highest) | `userSettings` | `~/.claude/settings.json` |
+| 2 | `projectSettings` | `.claude/settings.json` |
+| 3 | `localSettings` | `.claude/settings.local.json` |
+| 4 | `pluginHook` | Plugin-registered hooks (priority = 999) |
+| 5 | `builtinHook` | Built-in hooks shipped with Claude Code |
+| 6 (lowest) | `sessionHook` | Temporary runtime-registered hooks |
+
+**Why does `userSettings` have the highest priority?** This embodies the "user sovereignty" principle — users' personal configuration should be able to override project configuration and plugin defaults. In a multi-user collaborative project, each developer should be able to customize hook behavior according to their own security preferences.
+
+### Priority conflict resolution
+
+When multiple hooks match the same event, they all execute in priority order. A `decision: "block"` from any hook takes effect immediately — subsequent lower-priority hooks still execute (they see the blocked state), but the operation itself is already blocked.
+
+**Example: multiple hooks for the same event**
+
+```
+userSettings:    [Hook A: Audit log]          — executes 1st
+projectSettings: [Hook B: Security check]     — executes 2nd
+localSettings:   [Hook C: Local debugging]    — executes 3rd
+```
+
+**Matcher fine-grained control:** Use specific matchers to avoid running hooks on every tool call:
+
+```json
+{
+  "PreToolUse": [
+    { "matcher": "Bash(rm *)",      "hooks": [{ "type": "command", "command": "check_delete.py" }] },
+    { "matcher": "Bash(npm publish *)", "hooks": [{ "type": "command", "command": "check_publish.py" }] },
+    { "matcher": "Write",           "hooks": [{ "type": "command", "command": "check_write.py" }] }
+  ]
+}
+```
+
+## Three-layer security mechanism
+
+Claude Code provides three security gates that filter hook execution progressively. This embodies "Defense in Depth" — not relying on a single security measure but setting barriers at multiple levels.
+
+<Steps>
+  <Step title="Layer 1: Global disable">
+    When `policySettings` has `disableAllHooks: true`, all hooks (including managed hooks) are disabled. This is the ultimate emergency switch for security incidents or troubleshooting.
+  </Step>
+  <Step title="Layer 2: Managed mode check">
+    When `allowManagedHooksOnly: true` is set in policy settings, only enterprise policy-configured hooks are allowed. All hooks from user, project, and local sources are blocked.
+
+    **Use case:** A financial institution ensuring that only audited hooks run within the organization, blocking all developer-defined hooks regardless of their content.
+  </Step>
+  <Step title="Layer 3: Workspace trust check">
+    All hooks in interactive mode require the workspace to be trusted. Hook configuration is stored in `.claude/settings.json` — executing these commands in an untrusted workspace is unsafe.
+
+    **Supply chain attack defense:** When you clone an open-source project, its `.claude/settings.json` might contain malicious `PreToolUse` hooks designed to exfiltrate your sensitive data. Workspace trust check is the key defense against this attack vector.
+
+    Non-interactive sessions (SDK mode) implicitly grant trust.
+  </Step>
+</Steps>
+
+## Real-world example: enterprise security audit system
+
+This configuration implements a complete security audit flow using multiple hook types and lifecycle events:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 scripts/session_init.py --report-env",
+        "message": "Initializing security audit session..."
+      }]
+    }],
+    "PreToolUse": [
+      {
+        "matcher": "Bash(rm *)",
+        "hooks": [{
+          "type": "command",
+          "command": "python3 scripts/validate_delete.py",
+          "timeout": 3000,
+          "message": "Validating delete operation..."
+        }]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [{
+          "type": "prompt",
+          "prompt": "Analyze the file being written. If it modifies production config files (*.production.*), return {\"decision\": \"block\", \"reason\": \"Production config changes require approval\"}. Otherwise return {\"decision\": \"approve\"}. File content: $ARGUMENTS"
+        }]
+      }
+    ],
+    "PostToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{
+        "type": "http",
+        "url": "https://audit.internal.company.com/api/log",
+        "headers": { "Authorization": "Bearer $AUDIT_TOKEN" },
+        "allowedEnvVars": ["AUDIT_TOKEN"],
+        "async": true
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 scripts/check_completion.py",
+        "asyncRewake": true
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 scripts/session_summary.py",
+        "timeout": 1500
+      }]
+    }]
+  }
+}
+```
+
+This configuration delivers:
+- **SessionStart** → records environment info at session initialization
+- **PreToolUse (rm)** → security validation before delete operations (synchronous, blocks if unsafe)
+- **PreToolUse (Write)** → LLM semantic review of file write content targeting production configs
+- **PostToolUse (Bash)** → async audit log reporting to internal system (does not block agent)
+- **Stop** → async-rewake task completeness check after each response
+- **SessionEnd** → summary report generation at session end (within 1,500ms timeout)
+
+## Best practices and anti-patterns
+
+<CardGroup cols={2}>
+  <Card title="Keep hooks lightweight" icon="zap">
+    Hooks run on the agent's main execution path in sync mode. A 5-second hook makes users feel Claude Code is "stuck." Target under 1 second. Use async or async-rewake modes for time-consuming operations.
+  </Card>
+  <Card title="Handle exceptions gracefully" icon="shield">
+    Don't let hook exceptions crash the agent. Use `try-catch` in scripts (or shell `||` fallbacks), ensuring meaningful exit codes are returned even on script errors.
+  </Card>
+  <Card title="Use matchers for precise filtering" icon="filter">
+    Don't register a hook without a matcher on `PreToolUse` and then judge tool type in the script. Using `"matcher": "Bash"` reduces unnecessary hook execution across every tool call.
+  </Card>
+  <Card title="Follow least privilege" icon="lock">
+    Only intercept events you need and only use response fields you need. Don't register hooks on all events "just in case" — each hook has performance overhead and maintenance cost.
+  </Card>
+</CardGroup>
+
+**Anti-patterns to avoid:**
+
+| Anti-pattern | Problem | Correct approach |
+|---|---|---|
+| Time-consuming operations in `PreToolUse` (synchronous) | Waiting 5+ minutes before every tool call | Use async mode in `PostToolUse` for long operations |
+| Circular hook dependencies | Hook A triggers an event Hook B listens to, which triggers an event Hook A listens to | Ensure hook chains are directed and acyclic |
+| Overusing `updatedInput` | Silently modifying all Bash commands (e.g., adding `sudo`) breaks user expectations and creates privilege escalation risk | Use only for security enhancements that follow the transparency principle |
+| Missing timeout settings | A script hang infinitely blocks the agent | Always set explicit timeout values for Command hooks |

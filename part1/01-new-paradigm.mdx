@@ -1,0 +1,232 @@
+---
+title: "The new paradigm of agent programming"
+description: "How the shift from chatbot to autonomous agent gave rise to Agent Harness — the runtime framework that makes reliable, safe LLM-driven automation possible."
+---
+
+## From chatbot to agent: a paradigm shift
+
+In 2023, most developers interacted with LLMs in a single pattern: open a browser tab, type a prompt, receive text. The model was a conversational partner — it could explain, suggest, and generate, but it could not *act*. Every interaction with the real world — copying code to an editor, running commands in a terminal, pasting output back into the chat — required a human intermediary. This "human glue" pattern was slow and error-prone.
+
+The cognitive shift that began in 2024 was deceptively simple: **the real value of an LLM is not generating text, but serving as a reasoning engine that orchestrates tool calls.** Once the LLM moves from "answering questions" to "deciding which tools to call, with what parameters, and how to handle the results," its capability boundaries open completely.
+
+### The three waves of AI-assisted programming
+
+<Steps>
+  <Step title="Wave 1 — Code completion (2021–2022)">
+    GitHub Copilot and similar tools gave LLMs a window into the current file. The model could see a few hundred lines and suggest the next token. Interaction was synchronous, single-turn, and purely textual. The model could only speak; the developer still had to execute every suggestion by hand.
+  </Step>
+  <Step title="Wave 2 — Conversational assistants (2022–2023)">
+    ChatGPT and Claude proved that LLMs could sustain multi-turn dialogue across an entire project's scope. Developers began pasting compiler errors, test failures, and architectural questions into a chat window. The model's context window grew from hundreds to hundreds of thousands of tokens, but the fundamental limitation remained: the model could not touch the file system, run commands, or verify its own output.
+  </Step>
+  <Step title="Wave 3 — Autonomous agents (2024–present)">
+    Function calling and tool use transformed the LLM from a text generator into a reasoning engine that could coordinate real-world operations: reading files, executing shell commands, searching codebases, managing Git, and spawning sub-agents for parallel subtasks. Claude Code, launched in February 2025, represents the state of the art in this wave: a terminal-native agent harness built for the professional developer workflow.
+  </Step>
+</Steps>
+
+### Six engineering challenges that tool calling introduces
+
+Tool calling solved the "human glue" problem but introduced an entirely new class of engineering challenges. These challenges are not at the model level — they are systems engineering problems:
+
+<CardGroup cols={2}>
+  <Card title="Tool registration & discovery" icon="list">
+    Who manages the tool registry? How does the model learn which tools exist? How can new tools be added at runtime without a restart?
+  </Card>
+  <Card title="Parameter validation" icon="shield-check">
+    The model may pass incorrectly typed parameters, omit required fields, or supply out-of-range values. At which layer should validation live?
+  </Card>
+  <Card title="Permission control" icon="lock">
+    The model might request `rm -rf /`. Who decides whether a tool call should execute, and how do you balance safety against automation efficiency?
+  </Card>
+  <Card title="Error recovery" icon="rotate-ccw">
+    API calls time out, tools fail, and model output may not conform to the expected format. Each failure mode needs a recovery strategy, or the agent enters an error-retry loop.
+  </Card>
+  <Card title="State consistency" icon="database">
+    Multiple tool calls may operate on the same resources. How do you maintain consistency across rounds, and how do you avoid acting on stale data?
+  </Card>
+  <Card title="Concurrency & scheduling" icon="cpu">
+    Some tool calls can be parallelised (reading multiple files), while others must be serialised (create directory before writing files). How do you schedule intelligently?
+  </Card>
+</CardGroup>
+
+These six challenges gave birth to the architectural concept of an **Agent Harness**.
+
+---
+
+## What is an Agent Harness?
+
+> **Agent Harness** — a runtime framework built around an LLM that elevates the model from a text generator to an autonomous agent capable of interacting with the outside world safely, reliably, and efficiently.
+
+The common misconception is that an Agent Harness is just an LLM API wrapper with some tool-calling logic bolted on. The reality is more demanding. Consider building an agent that can "modify code and run tests":
+
+**A simple wrapper** calls the API, parses tool instructions from the output, executes the tools, stitches the results back into the prompt, and repeats. This works only in an idealised world where API calls never time out, model output is always well-formed, the context window is infinite, and all operations are safe.
+
+**An Agent Harness** accounts for the real world:
+
+- **Streaming output** — model responses arrive token by token. Users need to see the agent's reasoning in real time. Callbacks produce callback hell; Promise chains lose cancellability; EventEmitter introduces memory-leak risk. The harness needs a solution that is simultaneously streaming, cancellable, and type-safe.
+- **Permission control** — interception must be context-aware. `rm -rf node_modules` is safe in development; `rm -rf /etc` is never safe. A blanket allowlist cannot express this distinction.
+- **Context management** — as the conversation grows, the context window fills. The harness must decide when to compress, which information to preserve, and how compression interacts with the prompt cache.
+- **Error recovery** — every failure mode — truncated output, context overflow, tool timeout, user interrupt — needs its own recovery strategy within a unified framework.
+- **State persistence** — the agent must recover correctly after interruption, share state with sub-agents safely, and ensure that state updates are immutable and traceable.
+- **Extensibility** — third-party developers and automation pipelines need safe, stable extension points that do not require forking core code.
+
+<Warning>
+If your core agent loop is `while (true) { callAPI(); parseResponse(); executeTool(); }`, you may be repeating the "simple wrapper" mistake. Ask yourself: how does your system handle streaming output? Context overflow? Error recovery? If the answers are "not yet," you need an Agent Harness.
+</Warning>
+
+---
+
+## Claude Code's architecture at a glance
+
+Claude Code's `src` directory contains **1,884 TypeScript files** totalling **512,664 lines of code** — comparable in scale to the VS Code core codebase. This is not bloat; it is a reflection of the genuine engineering complexity of a production-grade Agent Harness.
+
+The architecture is organised into five core modules with a strict layered calling relationship:
+
+```
+Entry module
+  └── Query engine          (session state, lifecycle)
+        └── Dialog loop     (async generator, main heartbeat)
+              ├── Tool system   (45+ tools, concurrency scheduling)
+              └── Permission pipeline  (four-stage, five modes)
+                    └── Extension layer  (MCP, sub-agents, plugins, hooks)
+```
+
+### Technology stack choices
+
+<Tabs>
+  <Tab title="Runtime">
+    **Choice: Bun**
+
+    Bun provides native TypeScript execution without a compilation step, faster startup time than Node.js, and a built-in `fetch` API. For a terminal tool where startup latency is the user's first impression, shaving hundreds of milliseconds from cold start is a meaningful engineering goal.
+
+    Node.js requires a compilation step and is slower to start. Deno's ecosystem maturity was insufficient at the time Claude Code was architected.
+  </Tab>
+  <Tab title="Terminal UI">
+    **Choice: React + Ink**
+
+    Ink renders terminal UI using the React component model, enabling declarative UI, `useState`/`useEffect` state management, and component reuse — all patterns already familiar from web development. Tool execution progress bars, multi-column layouts, and permission confirmation dialogs are all React components underneath.
+
+    `blessed`/`ncurses` are too low-level. Raw `console.log` cannot express complex layouts. The choice of React + Ink reflects a core belief: **terminal UI should not be treated as second-class compared to web UI.**
+  </Tab>
+  <Tab title="Schema validation">
+    **Choice: Zod v4**
+
+    Zod provides runtime type safety for every tool call — the LLM's output is uncontrollable, and tools must protect themselves against malformed parameters. Crucially, Zod schemas simultaneously generate the JSON Schema sent to the API, so parameter descriptions the model sees are derived from the same type definitions developers write.
+
+    This is the perfect practice of "type definitions as documentation." Joi lacks type inference; io-ts has a steep learning curve.
+  </Tab>
+  <Tab title="CLI framework">
+    **Choice: Commander.js**
+
+    Commander.js handles command-line argument parsing, subcommand routing, and help generation. It is mature, well-tested, and appropriately scoped for Claude Code's CLI surface. `yargs` carries more weight; `oclif` targets larger-scale CLI applications with different trade-offs.
+  </Tab>
+  <Tab title="LLM SDK">
+    **Choice: @anthropic-ai/sdk**
+
+    The official Anthropic SDK provides streaming response support, automatic retry logic, and full type safety. Direct `fetch` calls would require reimplementing these capabilities and would lose type safety at the API boundary.
+  </Tab>
+</Tabs>
+
+The full stack at a glance:
+
+| Component | Choice | Key reason |
+|-----------|--------|------------|
+| Runtime | Bun | Native TypeScript, fast startup |
+| Terminal UI | React + Ink | Declarative, componentised, familiar patterns |
+| CLI framework | Commander.js | Mature, appropriately scoped |
+| Schema validation | Zod v4 | Runtime safety + JSON Schema generation |
+| LLM SDK | @anthropic-ai/sdk | Streaming, retry, type safety |
+
+---
+
+## Five design principles of Agent Harness
+
+By reading Claude Code's architecture, five design principles emerge that run through every subsystem. They are not isolated techniques; they form a mutually reinforcing network of architectural decisions.
+
+<AccordionGroup>
+  <Accordion title="Principle 1 — Async-streaming-first" icon="zap" defaultOpen={true}>
+    Claude Code's entire dialog loop is built on `AsyncGenerator`. This is a profound architectural decision, not a casual technology choice.
+
+    Traditional LLM calls use a request-response pattern: send a prompt, wait for the complete response, process the result. But an agent may execute multiple rounds of tool calls in a single user request, each producing intermediate states — thinking process, tool call plans, execution progress — that users need to see in real time.
+
+    `AsyncGenerator` satisfies all three requirements simultaneously:
+
+    - **Incremental output** — `yield` pushes streaming events step by step; the UI renders each one immediately.
+    - **Cancellability** — the caller can terminate the generator at any time via `generator.return()`, triggering the `finally` block for clean resource release.
+    - **Backpressure control** — if the consumer cannot keep up with the producer, the generator pauses automatically, preventing memory overflow.
+
+    Callbacks produce callback hell as event types multiply. Promise chains lose mid-stream cancellability. EventEmitter introduces memory leak risk and loses type safety. `AsyncGenerator` is the only solution that satisfies all three requirements.
+  </Accordion>
+
+  <Accordion title="Principle 2 — Security boundary embedded" icon="shield">
+    The permission system is not an add-on security layer grafted onto the outside of the architecture. It is embedded into the core pipeline. A tool call proposed by the LLM must pass through four distinct checkpoints before execution:
+
+    1. **Tool visibility filtering** — forbidden tools are removed from the tool list before it is sent to the model. The model cannot even "see" tools it should not use.
+    2. **Input validation** — the tool's `validateInput` method rejects malformed parameters before the permission check begins.
+    3. **Permission decision** — `canUseTool` weighs permission mode, tool danger level, user history, and rule matching to produce an allow/deny/ask decision.
+    4. **Runtime protection** — sandbox restrictions, timeout controls, and output size limits apply even after all prior checks pass.
+
+    This four-stage design embodies **defense in depth**: no single checkpoint is a silver bullet, but each layer can independently short-circuit unsafe operations.
+
+    A simple allowlist cannot express context-dependent safety. The same Bash command has completely different risk profiles under different parameters. The four-stage pipeline gives each layer the ability to make fine-grained, context-aware judgments.
+  </Accordion>
+
+  <Accordion title="Principle 3 — Cache-aware design" icon="database">
+    In the Anthropic API pricing model, Prompt Caching can significantly reduce both cost and latency. Claude Code's architecture considers cache friendliness at multiple levels:
+
+    - **System prompt stability** — the system prompt construction method is carefully designed so that when the tool list is unchanged, the byte content of the prompt remains consistent, reliably hitting the API-side prompt cache.
+    - **Sub-agent cache sharing** — sub-agents in Fork mode inherit the parent agent's `renderedSystemPrompt`, avoiding regeneration of prompts that might differ due to configuration changes.
+    - **Message history immutability** — messages already sent to the API are never modified; only new messages are appended, ensuring cache key stability.
+
+    An agent system that ignores caching rebuilds the system prompt on every API call. Minor configuration changes — such as tool list reordering — invalidate the entire cache. In sub-agent scenarios, parent and child agents cannot share cached prompts, leading to redundant computation. For a production agent making hundreds of API calls per day, these wastes accumulate into significant costs.
+  </Accordion>
+
+  <Accordion title="Principle 4 — Progressive capability extension" icon="layers">
+    Claude Code provides a four-level extension model, from built-in to external, from simple to complex:
+
+    | Level | Mechanism | Use case | Who uses it |
+    |-------|-----------|----------|-------------|
+    | Tool | Implement the `Tool<I,O,P>` interface | Add new atomic operations | Core developers |
+    | Skill | Declarative tool via Markdown + scripts | Reusable task templates | Advanced users |
+    | Plugin | Lifecycle-equipped toolkits | Organise related tools and config | Ecosystem developers |
+    | MCP Server | Standardised protocol for external tool integration | Third-party tool ecosystem | Third-party developers |
+
+    The design philosophy is **progressive enhancement**: simple needs can be met by declaring a Skill; complex integrations can connect external services through the MCP protocol. Each level builds on the previous one rather than replacing it.
+
+    Through MCP, Claude Code is not a closed system — it can dynamically discover and call tools provided by external servers, meaning the agent's capability boundaries are not preset by developers but can be extended at runtime.
+  </Accordion>
+
+  <Accordion title="Principle 5 — Immutable state flow" icon="lock">
+    Claude Code's state management draws on the immutable state patterns of Redux and Zustand. The core patterns:
+
+    - **Updater function pattern** — state updates receive a `(prev: T) => T` function rather than a new state value, ensuring every update is based on the previous state and avoiding race conditions.
+    - **Reference equality check** — reference comparison ensures notifications fire only when actual changes occur, avoiding unnecessary re-renders.
+    - **Wholesale replacement** — cross-iteration state in the dialog loop is updated by constructing a new object, never by mutating fields in place.
+
+    Without immutability, concurrent tool execution produces a classic race condition: Tool A modifies state while Tool B reads a partially updated, inconsistent snapshot. In sub-agent scenarios the risk is greater still — a child agent might accidentally modify the parent agent's state, making the main loop's behaviour unpredictable. These bugs depend on the specific scheduling order of asynchronous operations and are extraordinarily difficult to reproduce.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Interpreting architecture decisions as transferable patterns
+
+The five principles are not Claude Code-specific optimisations. They are generalised answers to the universal engineering challenges of agent systems:
+
+<CardGroup cols={2}>
+  <Card title="AsyncGenerator for streaming" icon="activity">
+    Any agent loop that needs to stream events, support cancellation, and apply backpressure should use `AsyncGenerator` over callbacks, Promise chains, or EventEmitter.
+  </Card>
+  <Card title="Defense in depth for permissions" icon="shield-check">
+    Security checkpoints should be embedded in the pipeline, not bolted on as a final gate. Context-aware, multi-stage permission evaluation is safer than any single allowlist.
+  </Card>
+  <Card title="Cache-aware prompt construction" icon="zap">
+    System prompt stability and message history immutability are inexpensive to design in from the start and expensive to retrofit. Design for cache hits from day one.
+  </Card>
+  <Card title="Immutable state for concurrency" icon="lock">
+    In any system where multiple asynchronous operations share state, immutable state objects with atomic update semantics prevent the entire class of partial-update race conditions.
+  </Card>
+</CardGroup>
+
+<Tip>
+When reading the subsequent chapters of this book, trace each subsystem design decision back to one of these five principles. Almost every "why is it designed this way?" question has an answer rooted in one of them.
+</Tip>

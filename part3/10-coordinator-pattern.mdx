@@ -1,0 +1,281 @@
+---
+title: "The Coordinator Pattern — Multi-Agent Orchestration"
+description: "How the Coordinator pattern implements centralized multi-agent orchestration through a coordinator-worker architecture, four-phase workflow, and Scratchpad collaboration space."
+---
+
+When a single agent cannot handle complex engineering tasks, Claude Code provides the Coordinator pattern — a centralized multi-agent orchestration solution. Unlike the Fork pattern's peer-to-peer parallelism, the Coordinator employs a "coordinator-worker" architecture where a dedicated coordinator manages the full lifecycle and task allocation of multiple parallel workers.
+
+Think of it like a construction site: the project manager (Coordinator) doesn't lay bricks personally, but knows which workers are experts at what, which tasks can run in parallel, which have dependencies, and how to coordinate shared resources. When a worker encounters a problem, the project manager decides whether to reassign or adjust the overall plan.
+
+---
+
+## Dual gating activation
+
+The Coordinator pattern uses two independent gating mechanisms:
+
+<CardGroup cols={2}>
+  <Card title="Compile-time feature gate" icon="code">
+    Determines whether the Coordinator's code is compiled into the binary at all. Deployments that don't need Coordinator functionality — such as lightweight SDK embedding scenarios — can completely exclude the related code, reducing binary size and attack surface.
+  </Card>
+  <Card title="Runtime environment variable" icon="toggle-right">
+    `CLAUDE_CODE_COORDINATOR_MODE` controls activation at runtime. Even in builds that include the feature, it must be explicitly enabled. This "compile-time exclusion + runtime explicit enable" pattern satisfies both flexibility and the principle of least privilege.
+  </Card>
+</CardGroup>
+
+### Mutual exclusion with Fork mode
+
+When both Coordinator and Fork conditions are satisfied simultaneously, Coordinator takes priority:
+
+| Mode | When active | Fork behavior |
+|---|---|---|
+| Coordinator mode | `isCoordinatorMode()` returns true | Fork automatically disabled |
+| Fork mode | Feature gate enabled, no Coordinator | Normal fork parallelism |
+| Normal mode | Neither active | Synchronous sub-agents |
+
+<Note>
+When Coordinator mode is activated, the built-in agent registry no longer returns the normal built-in agent list. Instead, Coordinator-specific worker agent definitions are introduced through lazy loading, avoiding circular dependencies between the coordinator module and the tool module.
+</Note>
+
+### Session recovery
+
+The `matchSessionMode()` function ensures pattern consistency during session recovery. When the current mode doesn't match the session's recorded mode, the system automatically sets the environment variable to match. A user who created a session in Coordinator mode but forgot to set the environment variable when recovering will have Coordinator mode automatically activated — no inconsistent behavior or errors.
+
+---
+
+## The coordinator-worker authority split
+
+The Coordinator enforces a strict separation between management authority and execution authority.
+
+### Coordinator: management authority only
+
+The coordinator is not an executor — it is an orchestrator. It directly answers simple questions and delegates all complex tasks to workers. Its tool set is intentionally minimal:
+
+| Tool | Purpose |
+|---|---|
+| `Agent` | Spawn workers and assign tasks |
+| `TaskStop` | Stop a running worker |
+| `SendMessage` | Send messages to workers |
+| Structured output | Deliver final results |
+
+<Warning>
+The coordinator does **not** have `Read`, `Write`, `Edit`, `Bash`, or any other execution tools. It cannot directly modify code or files. All actual work must be done indirectly through workers. This constraint is enforced both by the tool set and by explicit system prompt instructions.
+</Warning>
+
+### Workers: execution authority
+
+Workers receive the full development toolset — `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, MCP tools, and Skill tools — but explicitly exclude all team management tools (`Agent`, `TaskStop`, `SendMessage`).
+
+**Two tool set modes:**
+
+| Mode | Available tools | When to use |
+|---|---|---|
+| Simple | `Bash`, `Read`, `Edit` | CI/CD pipelines, resource-constrained containers, quick validation |
+| Full | All whitelisted tools | Local development, full IDE integration, complex refactoring |
+
+Workers default to the `acceptEdits` permission mode — they automatically accept file edits without asking for user confirmation. This is intentional: workers are executors and should not be hindered by permission dialogs. However, it means the coordinator must assign tasks with precision.
+
+<Tip>
+Because workers automatically accept edits, users should review the coordinator's complete task allocation plan before it begins the implementation phase. Add a requirement to your CLAUDE.md that forces the coordinator to present the full plan before starting.
+</Tip>
+
+---
+
+## Four addressing modes for worker communication
+
+The `SendMessageTool` supports four addressing modes, enabling flexible communication patterns across different deployment topologies:
+
+| Mode | Format | Use case | Scope |
+|---|---|---|---|
+| Point-to-point | `to: "agent-name"` | Send specific instructions to a designated worker | Single worker |
+| Broadcast | `to: "*"` | Publish shared information to all workers simultaneously | All workers |
+| UDS | `to: "uds:<socket-path>"` | Cross-process communication (different CLI instances) | Cross-process |
+| Bridge | `to: "bridge:<session-id>"` | Cross-session or cross-machine communication | Cross-session / remote |
+
+Workers communicate results back to the coordinator automatically via `<task-notification>` XML. Workers never communicate directly with each other — all inter-worker knowledge sharing goes through the Scratchpad (see below).
+
+**The stop-resume pattern:** When the coordinator sends a message to a stopped worker, the system automatically resumes that worker and delivers the message as a new prompt. Workers can stop after completing their investigation, releasing resources, and then be reactivated when needed — without rebuilding context from scratch.
+
+---
+
+## The Scratchpad collaboration space
+
+The Coordinator introduces the Scratchpad — a shared temporary file space at `/tmp/claude-{uid}/{sanitized-cwd}/{sessionId}/scratchpad/`. Workers can freely read and write to this directory without permission prompts.
+
+**Design principles:**
+
+- **No permission prompts.** Workers write findings immediately, without interrupting the workflow for user confirmation.
+- **Persistent cross-worker knowledge.** One worker writes an analysis; any subsequent worker can read it on demand.
+- **Session isolation.** Each session has an independent scratchpad directory — no cross-session contamination.
+- **Structural freedom.** The system prescribes no file structure; workers organize it as the task requires.
+
+**Why the Scratchpad rather than direct message passing?** Messages are ephemeral — once consumed, gone. The Scratchpad is persistent and can be read repeatedly by any number of workers. It naturally supports incremental building: Worker A writes a foundational analysis, Worker B appends supplementary information on top of it, without needing to consolidate everything into a single message.
+
+---
+
+## The four-stage coordinator-worker workflow
+
+The coordinator's system prompt defines a structured four-phase task execution model:
+
+<Steps>
+  <Step title="Research — parallel investigation">
+    Multiple research workers run in parallel to investigate the codebase. Each worker writes its findings to the Scratchpad. Since research is read-only, there are no file conflicts and workers can fan out freely.
+
+    **Output:** Scratchpad analysis documents (API analysis, database schema, dependency map, etc.)
+  </Step>
+  <Step title="Synthesis — coordinator digests and specifies">
+    The coordinator reads all scratchpad files, understands the overall architecture, and writes a precise implementation specification. This phase has a critical constraint: **the coordinator must understand the findings itself** before writing the spec.
+
+    The system prompt uses explicit language:
+    > "Never write 'based on your findings' or 'based on the research.' These phrases delegate understanding to the worker instead of doing it yourself. You never hand off understanding to another worker."
+
+    The coordinator cannot forward Worker A's report directly to Worker B. It must digest all findings, then write an implementation spec that contains specific file paths, line numbers, and exact modification instructions.
+
+    **Output:** Implementation specification document in the Scratchpad.
+  </Step>
+  <Step title="Implementation — precise file-exclusive workers">
+    Workers implement the specification. The coordinator enforces file exclusivity: write-heavy tasks assign one file set per worker to prevent conflicts. Workers in this phase often have non-overlapping file ownership.
+
+    **Concurrency rule:** Read-only tasks can run freely in parallel. Write-heavy tasks run one set of files at a time. Verification can sometimes run in parallel with implementation when operating on different file regions.
+
+    **Output:** Code changes committed to the working tree.
+  </Step>
+  <Step title="Verification — correctness checking">
+    One or more verification workers test whether the modifications are correct. They may run in parallel when testing independent subsystems.
+
+    **Output:** Test results and issue list, reported back to the coordinator via task notification.
+  </Step>
+</Steps>
+
+### Why the coordinator cannot delegate understanding
+
+In traditional master-slave architectures, the master can simply forward a slave's results to another slave. In an AI agent system, this forwarding causes severe context loss:
+
+- **Format inconsistency.** Different workers produce output in different formats; direct forwarding causes the recipient to misunderstand.
+- **Coexistence of redundancy and gaps.** Worker A's report may contain many irrelevant details while missing critical information.
+- **No global perspective.** Each worker only sees the portion it investigated; globally optimal decisions require integrating all findings.
+
+Requiring the coordinator to digest all findings first ensures workers in the implementation phase receive unified, precise, contextualized instructions.
+
+---
+
+## Task notification protocol
+
+When workers complete, results flow back to the coordinator as `<task-notification>` XML embedded in user-role messages:
+
+```xml
+<task-notification>
+  <task-id>{agentId}</task-id>
+  <status>completed|failed|killed</status>
+  <summary>{human-readable status summary}</summary>
+  <result>{agent's final text response}</result>
+  <usage>
+    <total_tokens>N</total_tokens>
+    <tool_uses>N</tool_uses>
+    <duration_ms>N</duration_ms>
+  </usage>
+</task-notification>
+```
+
+XML tags have better recognizability in LLM contexts than JSON: Claude models parse XML tags reliably, while JSON requires strict quote and comma matching. The explicit `<task-notification>` tag allows the model to distinguish worker result reports from genuine user messages through simple pattern matching.
+
+---
+
+## Complete case study: adding a notification system
+
+**Requirement:** "Add a notification system to our Express.js application supporting email and in-app notification methods, with user preference management."
+
+<Accordion title="Phase 1: Research (parallel)">
+
+The coordinator dispatches three workers simultaneously:
+
+- **`api-researcher`** → investigates route structure, middleware chain, API versioning → writes `/scratchpad/api-analysis.md`
+- **`db-researcher`** → investigates ORM models and migration strategy → writes `/scratchpad/db-analysis.md`
+- **`frontend-researcher`** → investigates React component structure and state management → writes `/scratchpad/frontend-analysis.md`
+
+All three workers run in parallel since they touch different parts of the codebase.
+</Accordion>
+
+<Accordion title="Phase 2: Synthesis (coordinator)">
+
+The coordinator reads all three scratchpad files, then writes `/scratchpad/implementation-spec.md` containing:
+
+- Database: add `Notification` and `NotificationPreference` Prisma models
+- API: 5 new endpoints (GET/POST/PUT/DELETE notifications + PUT preference settings)
+- Service layer: `NotificationService` for email and in-app dispatch
+- Frontend: modify `SettingsPage.tsx` to add notification preference component
+- Dependencies: install `nodemailer`
+</Accordion>
+
+<Accordion title="Phase 3: Implementation (workers)">
+
+The coordinator analyzes the spec and determines parallelism:
+
+- **`db-implementer`** — modifies `prisma/schema.prisma` (exclusive)
+- **`service-implementer`** — implements `src/services/notificationService.ts` and `src/routes/notifications.ts` (parallel with `db-implementer`, no overlap)
+- **`frontend-implementer`** — implements `src/components/NotificationSettings.tsx` and modifies `SettingsPage.tsx` (starts after both above complete)
+</Accordion>
+
+<Accordion title="Phase 4: Verification (worker)">
+
+A single verifier checks:
+
+- Whether the Prisma migration is correct
+- Whether API endpoints conform to RESTful conventions
+- Whether the frontend component correctly calls the API
+- Whether error handling is complete
+- Whether default notification preference values are reasonable
+</Accordion>
+
+---
+
+## Fault recovery
+
+Worker failures are normal in multi-agent workflows. The coordinator handles them through the task notification's `status` field:
+
+| Failure type | Manifestation | Coordinator strategy |
+|---|---|---|
+| Tool execution failure | Bash returns non-zero exit code | Analyze cause, retry or adjust |
+| Output truncation | `maxTurns` exhausted, task incomplete | Evaluate completed portion, decide whether to reassign |
+| MCP connection dropped | External tool unavailable | Degrade to a strategy without that tool |
+| Context too long | Conversation exceeds token limit | Compress context or split into smaller sub-tasks |
+
+**Handling partial completion:** When a research worker completes 80% of its investigation, the coordinator should write the implementation spec based on available information — flagging uncertain portions with confidence annotations:
+
+- `[HIGH]` — confirmed file paths and function signatures
+- `[MEDIUM]` — inferred dependency relationships requiring verification during implementation
+- `[LOW]` — areas not fully investigated; additional research needed before implementation
+
+---
+
+## Anti-patterns in multi-agent orchestration
+
+<AccordionGroup>
+  <Accordion title="Worker inspecting another worker">
+    Allowing Worker A to read Worker B's results before reporting to the coordinator creates information chains where each relay loses detail. The coordinator must always receive each worker's results directly, understand them itself, and write the next instructions.
+  </Accordion>
+  <Accordion title="Deleting a team before work completes">
+    Forcibly deleting a team while workers are still running causes: task notifications that fail to reach the coordinator, Scratchpad files deleted while workers are reading them, and worktrees cleaned up with in-progress modifications lost. Team deletion requires all members to have completed.
+  </Accordion>
+  <Accordion title="Coordinator executing directly">
+    If the coordinator uses `Bash` or `Write` to fix something itself instead of delegating to a worker, it bypasses the worker's full toolset, disrupts the clear authority boundary, and creates state inconsistency between what the coordinator knows and what workers can see.
+  </Accordion>
+  <Accordion title="Fabricating or predicting worker results">
+    The system prompt explicitly prohibits the coordinator from predicting or fabricating worker results. All results must come from actual task notifications. Fabricated results create divergence between the coordinator's internal model and actual codebase state.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Coordinator vs. Fork: choosing the right pattern
+
+| Dimension | Coordinator | Fork |
+|---|---|---|
+| Architecture | Centralized (coordinator-worker) | Decentralized (peer parallelism) |
+| Context sharing | Workers see only their assigned task | All sub-agents inherit the full parent context |
+| Communication | Coordinator relays; Scratchpad for persistence | No direct communication; each operates independently |
+| Cache efficiency | No shared cache prefix | Byte-level sharing; highly efficient |
+| Fault recovery | Coordinator can reassign tasks | Primary agent decides after receiving failure notification |
+| Resource overhead | Higher (coordinator is persistent) | Lower (shared cache) |
+| Best for | Coordinated multi-step tasks requiring knowledge sharing | Independent parallel investigation or search tasks |
+
+**Decision rule:** Use Coordinator when the task requires synthesizing findings across multiple investigation streams before implementation. Use Fork when tasks are independent and share the same context. The two patterns are mutually exclusive — activating Coordinator automatically disables Fork.

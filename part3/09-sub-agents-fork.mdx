@@ -1,0 +1,397 @@
+---
+title: "Sub-Agents and the Fork Pattern"
+description: "How Claude Code spawns and manages specialized sub-agents, and how the Fork pattern achieves byte-level context inheritance for cache-efficient parallel execution."
+---
+
+The true power of Claude Code lies not in single-turn conversation, but in its capacity to delegate complex tasks to specialized sub-agents for parallel processing. This chapter provides a deep architectural analysis of the AgentTool system, the four built-in agent types, and the Fork pattern's ingenious cache-sharing strategy.
+
+## Agent sources and loading priority
+
+Every agent in Claude Code originates from one of three sources, resolved in a strict priority chain:
+
+<Steps>
+  <Step title="Built-in agents">
+    Compiled into the binary and available out of the box. These are the lowest-priority defaults, covering the four canonical software engineering roles: Explore, Plan, General Purpose, and Verification.
+  </Step>
+  <Step title="Plugin agents">
+    Provided by installed plugins and can override built-in agents with the same name. Plugins carry additional version and dependency metadata.
+  </Step>
+  <Step title="User, project, flag, and policy settings">
+    Settings cascade in ascending priority order: `userSettings` → `projectSettings` → `flagSettings` → `policySettings`. Policy-level agents — used in enterprise deployments — always win, allowing administrators to enforce organization-wide behavior by overriding any built-in agent by name.
+  </Step>
+</Steps>
+
+<Note>
+Enterprise administrators can define an agent named `code-review` in policy settings to override the built-in agent with the same name, injecting company-specific security checklists and internal MCP server connections. Regardless of personal configuration, enterprise standards always apply.
+</Note>
+
+Each agent definition is based on the `BaseAgentDefinition` type, whose fields fall into four functional groups:
+
+| Group | Fields |
+|---|---|
+| Identity & Description | `agentType`, `whenToUse`, `color` |
+| Tools & Capabilities | `allowedTools`, `disallowedTools`, `skills`, `mcpServers` |
+| Execution Control | `model`, `effort`, `maxTurns`, `permissionMode`, `background` |
+| Context Management | `omitClaudeMd`, `isolationMode`, `hooks`, `memory` |
+
+---
+
+## The four built-in agent types
+
+Built-in agents collectively cover the four core software engineering workflows: exploration, planning, execution, and verification.
+
+<Tabs>
+  <Tab title="Explore">
+    ### Explore — Read-only code exploration
+
+    The Explore Agent is a high-speed, read-only search agent optimized for code archaeology and architecture discovery.
+
+    **Design decisions:**
+
+    - **Dual-lock read-only enforcement.** At the prompt level, the system declares strict disallowed operations. At the tool level, `Edit`, `Write`, and similar tools are physically blocked via `disallowedTools`. Even if the model hallucinates a file modification, it is physically prevented.
+    - **`omitClaudeMd` optimization.** CLAUDE.md contains coding conventions, commit formats, and PR templates — none of which are useful for a search-only agent. Omitting it reduces token consumption and removes noise, letting the model focus entirely on the search task. This optimization is estimated to save 5–15 billion tokens per week across all users.
+    - **Haiku model.** Explore can optionally use the Haiku model to reduce cost, since search tasks do not require frontier reasoning capability.
+
+    **Best uses:** Code archaeology (tracing bug call chains), dependency analysis, architecture mapping, constant or configuration lookups.
+  </Tab>
+  <Tab title="Plan">
+    ### Plan — Structured planning agent
+
+    The Plan Agent reuses the Explore Agent's read-only toolset but acts as a software architect rather than a searcher. Its system prompt requires structured output that concludes with a prioritized "key files" list for the implementation phase.
+
+    **Typical output structure:**
+
+    | Element | Purpose |
+    |---|---|
+    | Problem analysis | Validates the correct implementation direction |
+    | Implementation steps | Ordered modification steps for the General Agent to execute |
+    | Key files | Reduces search overhead in subsequent phases |
+    | Risk assessment | Focus areas for the Verification Agent |
+    | Dependencies | Determines which steps can run in parallel |
+
+    **Why omit CLAUDE.md?** The Plan Agent should not be constrained by project-specific style rules during the planning phase. Seeing naming conventions might cause it to deliberate on naming instead of architecture. Omitting CLAUDE.md lets it focus on *what* to do, leaving *how* to do it for the implementation phase.
+  </Tab>
+  <Tab title="General Purpose">
+    ### General Purpose — Full-permission executor
+
+    The General Purpose Agent uses the wildcard `'*'` to allow all tools. It is the "executor" — Explore performs reconnaissance, Plan creates the blueprint, and General Purpose does the actual modifications.
+
+    Its design philosophy is **trust by default, push boundaries to the perimeter**: no preset restrictions at the tool level, relying instead on the global security layer (permission system, `filterToolsForAgent`) to ensure safety. This maximizes flexibility, allowing different tasks to dynamically combine different tool sets without pre-defining whitelists for each task type.
+
+    <Warning>
+    Do not use the General Purpose Agent for read-only tasks. The Explore Agent is cheaper (Haiku model), more token-efficient (omits CLAUDE.md), and safer (physically blocks write tools). Always apply the principle of least privilege.
+    </Warning>
+  </Tab>
+  <Tab title="Verification">
+    ### Verification — Adversarial verification agent
+
+    The Verification Agent is unique: it is explicitly designed to **break the code being verified as thoroughly as possible**, not to confirm that it works. It uses a red UI indicator to emphasize its adversarial nature, always runs in the background, and is prohibited from modifying project files.
+
+    **Two failure modes it guards against:**
+
+    1. **Verification avoidance.** LLMs tend to find excuses not to run tests ("the logic looks correct", "the test environment is complex"). The system prompt lists common self-rationalization excuses and requires actual execution, not verbal confirmation.
+    2. **Surface correctness trap.** Code may pass happy-path tests but fail at boundary conditions, concurrency scenarios, or error paths. The prompt requires explicit attention to "less obvious" failure modes.
+
+    This adversarial design applies the Red Teaming concept: traditional testing verifies "code works as expected," while red team testing verifies "code won't crash under unexpected circumstances." Two instances of the same LLM fight each other — a self-adversarial mechanism.
+
+    **Why run in the background?** Verification is a "waitable" task. Background execution frees the main thread, allows the user to keep interacting, and forces the Verification Agent to work independently without waiting for user input.
+  </Tab>
+</Tabs>
+
+---
+
+## The Fork pattern: cache-safe parallel execution
+
+The Fork pattern is one of the most sophisticated architectural innovations in Claude Code. It allows the main agent to "fork" its complete context to multiple parallel sub-tasks while leveraging the Anthropic API's prompt cache mechanism to avoid retransmitting large numbers of tokens.
+
+### Intuition: fork() for LLM contexts
+
+The Fork pattern shares conceptual DNA with the Unix `fork()` system call:
+
+| Dimension | Unix `fork()` | Claude Code Fork |
+|---|---|---|
+| Trigger | Parent process calls `fork()` | Main agent calls Agent tool |
+| Inherited content | Memory image, file descriptors | System prompt, tool definitions, conversation history |
+| Post-fork relationship | Parent-child processes run independently | Main/sub-agents run in parallel |
+| Communication | pipe / shared memory | Task notification XML |
+| Resource savings | Copy-on-Write memory sharing | Prompt Cache token sharing |
+| Recursion protection | Process-level limits | `querySource` check |
+
+### Activation conditions
+
+Fork mode requires three conditions to be satisfied simultaneously:
+
+1. The Fork feature gate must be enabled at compile time
+2. Coordinator mode must be **inactive** (the Coordinator has its own task delegation model)
+3. The session must not be in non-interactive mode
+
+When the user omits the sub-agent type in an Agent tool call and Fork mode is enabled, the system automatically routes to the Fork path.
+
+### Byte-level context inheritance
+
+The core principle of Fork is **byte-level inheritance** — the sub-agent must share exactly the same API request prefix as the parent agent to hit the prompt cache.
+
+The Fork path prioritizes using the system prompt bytes already rendered by the parent agent, passing them directly rather than reconstructing the prompt. Reconstruction can produce differences in whitespace, attribute order, or feature gate hot/cold states — and even a single character difference at the byte level is sufficient to invalidate the entire cache prefix.
+
+<Info>
+Prompt cache works through byte prefix matching, like HTTP's ETag mechanism. Even if two prompts are semantically identical, a single extra space invalidates the cache. This is why Fork passes rendered raw bytes rather than reconstructing.
+</Info>
+
+### CacheSafeParams: the five dimensions
+
+Cache hits require all five dimensions of `CacheSafeParams` to be byte-identical:
+
+<CardGroup cols={2}>
+  <Card title="systemPrompt" icon="terminal">
+    The system prompt bytes, passed as rendered raw output from the parent agent to guarantee an exact match.
+  </Card>
+  <Card title="userContext" icon="user">
+    User context including CLAUDE.md content. Any deviation here invalidates the cache.
+  </Card>
+  <Card title="systemContext" icon="server">
+    System-injected context information added by Claude Code at the infrastructure level.
+  </Card>
+  <Card title="toolUseContext" icon="wrench">
+    Tool definitions and model selection. Fork uses the `useExactTools` flag to pass the parent's tool pool directly, preventing any deviation in tool definition bytes.
+  </Card>
+</CardGroup>
+
+The fifth dimension — `forkContextMessages` — carries the conversation history prefix messages. All five must match simultaneously for a cache hit. Any single deviation causes full reprocessing.
+
+### How buildForkedMessages maximizes cache area
+
+The Fork message construction function is the core of cache sharing. Its algorithm:
+
+<Steps>
+  <Step title="Preserve the parent assistant message">
+    Retain the complete parent assistant message, including all `tool_use` blocks, thinking, and text. New UUIDs are assigned to avoid ID collisions.
+  </Step>
+  <Step title="Generate uniform placeholder results">
+    For every `tool_use` block, generate a fixed-string placeholder `tool_result`: `"Fork started -- processing in background."` This identical string is shared across all Fork sub-agents.
+  </Step>
+  <Step title="Construct the task directive message">
+    Build a single user message containing the placeholder results followed by the sub-task directive.
+  </Step>
+</Steps>
+
+The result: all Fork sub-agents share an identical prefix `[...history, assistant(all_tool_uses), user(placeholder_results)]`. Only the final directive text differs — maximizing the cache hit area.
+
+**Concrete efficiency example:**
+
+Assume the parent conversation has 50,000 tokens of history, the parent assistant message has 3 `tool_use` blocks (~2,000 tokens), and the system prompt and tool definitions are ~10,000 tokens.
+
+| Approach | Input tokens |
+|---|---|
+| Without Fork (3 independent sub-agents) | 3 × 62,000 = **186,000 tokens** |
+| With Fork (shared prefix) | 62,000 + 3 × 200 = **62,600 tokens** |
+| **Savings** | **~66%** |
+
+At scale — dozens of Fork calls per session — these savings compound significantly.
+
+---
+
+## Recursive Fork protection
+
+Fork sub-agents retain the Agent tool to maintain cache-consistent tool definitions, which means recursive Forking must be prevented. The system implements a dual-detection strategy:
+
+<AccordionGroup>
+  <Accordion title="Primary defense: querySource check">
+    A runtime marker set in the Fork sub-agent's context, identifying "I was forked." Because it lives in context options rather than conversation history, it is unaffected by the context compression mechanism — reliable recursion prevention even in very long conversations.
+  </Accordion>
+  <Accordion title="Fallback: message scanning">
+    Scans for specific tags in the message history, handling edge cases where `querySource` might be lost during serialization or deserialization. This is a defensive programming safety net.
+  </Accordion>
+</AccordionGroup>
+
+The sub-task directive explicitly enforces behavioral constraints: it declares that the agent is a Fork worker rather than the main agent, prohibits spawning sub-agents, and prohibits asking questions or suggesting next steps.
+
+<Warning>
+Allowing recursive Forking would cause exponential resource growth (each Fork creates new API connections and tool instances), multi-level result aggregation complexity, near-impossible debugging, and cache hit rates that plummet at each recursion depth.
+</Warning>
+
+---
+
+## Custom agents
+
+### Defining agents in `.claude/agents/`
+
+Custom agents are declared as Markdown files in the `.claude/agents/` directory. The system parses YAML frontmatter for configuration and uses the Markdown body as the system prompt.
+
+```markdown
+---
+name: security-auditor
+description: Analyze security vulnerabilities in code and generate audit reports
+tools:
+  - Bash
+  - Read
+  - Grep
+  - Glob
+disallowedTools:
+  - Write
+model: haiku
+effort: high
+permissionMode: default
+maxTurns: 30
+color: orange
+background: true
+memory: project
+skills:
+  - /commit
+mcpServers:
+  - slack
+hooks:
+  PreToolUse:
+    - matcher: Bash
+      command: "audit-log.sh"
+---
+
+You are a code security audit expert. Your responsibilities are:
+
+1. Analyze potential security vulnerabilities in code
+2. Check for common attack vectors (XSS, SQL injection, CSRF, etc.)
+3. Generate structured audit reports
+4. Provide remediation recommendations
+```
+
+The `name` field maps to `agentType`. If the `memory` field is enabled, the system automatically injects file read/write tools to support persistent memory.
+
+### More agent examples
+
+<AccordionGroup>
+  <Accordion title="Documentation generation agent">
+
+```markdown
+---
+name: doc-writer
+description: Generate API documentation and usage guides for code
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Write
+disallowedTools:
+  - Bash
+model: haiku
+effort: medium
+maxTurns: 20
+color: blue
+background: true
+---
+
+You are a technical documentation expert. Your responsibilities are:
+
+1. Read function signatures, type definitions, and comments in code
+2. Generate structured API documentation
+3. Write usage examples for complex logic
+4. Keep documentation style consistent with existing docs
+```
+
+  </Accordion>
+  <Accordion title="Test generation agent">
+
+```markdown
+---
+name: test-generator
+description: Automatically generate unit tests and integration tests for specified modules
+tools:
+  - Read
+  - Write
+  - Grep
+  - Glob
+  - Bash
+model: inherit
+effort: high
+maxTurns: 40
+color: green
+background: true
+---
+
+You are a test engineer. Your tasks are:
+
+1. Read the source code of the target module and understand its public interfaces
+2. Identify all code paths that need testing
+3. Write test cases for each path
+4. Ensure coverage: normal paths, boundary conditions, error handling
+```
+
+  </Accordion>
+  <Accordion title="Performance analysis agent">
+
+```markdown
+---
+name: perf-analyzer
+description: Analyze code performance bottlenecks and provide optimization recommendations
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash
+disallowedTools:
+  - Write
+  - Edit
+model: inherit
+effort: high
+maxTurns: 25
+color: yellow
+---
+
+You are a performance analysis expert. Your tasks are:
+
+1. Identify hotspots (O(n²) loops, unnecessary memory allocations, frequent I/O)
+2. Analyze database query efficiency (N+1 queries, missing indexes)
+3. Evaluate whether concurrency and async patterns are used appropriately
+4. Provide optimization recommendations with estimated performance improvements
+```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Agent tool isolation
+
+Sub-agent tool access is governed by a three-layer filtering mechanism:
+
+| Layer | Scope | Effect |
+|---|---|---|
+| Global disallow list | All sub-agents | Permanently blocks `Agent`, `ExitPlanMode`, `TaskOutput`, `TaskStop`, `AskUserQuestion` |
+| Async whitelist | Background agents | Restricts to core tools: `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebSearch`, etc. |
+| `filterToolsForAgent` | Final arbitration | MCP tools always pass; globally disallowed tools always block; in-process teammates get partial exemption |
+
+<Info>
+MCP tools are always available to sub-agents. They represent tools explicitly authorized by the user through permission configuration. Since Claude Code cannot predict MCP tool behavior, safety control is delegated to MCP's own permission system.
+</Info>
+
+---
+
+## Sub-agent lifecycle
+
+A sub-agent passes through well-defined state transitions from creation to cleanup:
+
+<Steps>
+  <Step title="Context construction">
+    The runner generates the system prompt, assembles the tool pool based on `allowedTools`/`disallowedTools` and the global filter, initializes agent-specific MCP server connections, preloads specified skills, and injects persistent memory if enabled.
+  </Step>
+  <Step title="Running">
+    The agent executes its task, alternating between producing output and waiting for tool results. It continues until the task is complete, `maxTurns` is reached, an error occurs, or the user interrupts.
+  </Step>
+  <Step title="Completion">
+    The runner generates a task notification, closes agent-specific MCP connections (non-specific connections remain managed by the parent), releases tool references, and formats results for the caller. Background agents queue their notification for processing in the main agent's next turn.
+  </Step>
+</Steps>
+
+<Tip>
+Set `maxTurns` based on task complexity. Recommended empirical ranges: read-only search (10–15), code generation (20–30), complex refactoring (30–50), exploratory tasks (15–20). For background agents, err on the lower side as a safety valve against runaway execution.
+</Tip>
+
+---
+
+## When to use sub-agents vs. tool calls
+
+| Situation | Prefer sub-agents | Prefer tool calls |
+|---|---|---|
+| Task complexity | High — multi-step with branching | Low — single deterministic operation |
+| Parallelism | Multiple independent workstreams | Sequential dependencies |
+| Context isolation | Agent needs a focused, narrower context | Full conversation context is needed |
+| Specialization | A distinct expert role is beneficial | General capability suffices |
+| Cost sensitivity | Haiku model for search tasks saves tokens | Frontier model already active |

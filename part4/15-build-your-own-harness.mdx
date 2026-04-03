@@ -1,0 +1,840 @@
+---
+title: "Building Your Own Agent Harness"
+description: "A six-step implementation roadmap for building a production-grade Agent Harness, with observability, security, and circular dependency solutions."
+---
+
+> "The rules of thinking are lengthy and fortuitous. They require plenty of thinking of most long duration and deep meditation for a wizard to wrap one's noggin around."
+> — Comment in Claude Code source
+
+This chapter synthesizes the complete engineering pipeline explored throughout this book — from dialog loop to production deployment — into a concrete plan for designing and building your own Agent Harness. The six-step roadmap below is incremental: each step builds on the last, and the result is a minimal but fully runnable Harness you can extend further.
+
+---
+
+## Design principles review
+
+Before writing code, it helps to revisit the five principles that run through Claude Code's architecture. Understanding the *why* matters more than memorizing the *what* — when your project encounters scenarios Claude Code doesn't cover, principles guide you toward consistent decisions.
+
+<Tabs>
+  <Tab title="Loops over recursion">
+    Claude Code's core query function is an `AsyncGenerator` that manages state transitions through a `while(true)` loop with `continue` statements. Each iteration destructures state, then writes a new `State` object at each `continue` site.
+
+    Three reasons loops outperform recursion for Agent scenarios:
+
+    | Concern | Loop | Recursion |
+    |---------|------|-----------|
+    | State recovery | Reassign one variable | Unwind the entire call stack |
+    | Abort control | Single `AbortController` check at loop top | Signal must be passed and checked at every recursive level |
+    | Debugging | State changes happen at a fixed code location | State is scattered across multiple call stack frames |
+
+    <Note>
+      Claude Code's auto-compact mechanism compresses context without ending the conversation. In a loop this is "replace message list + continue." In recursion it requires exceptions or special return values.
+    </Note>
+  </Tab>
+
+  <Tab title="Schema-driven">
+    Each tool defines its input parameters through a Zod Schema, and the `buildTool` factory automatically fills in default behavior from partial definitions. Validation logic, permission checks, and description generation all derive from the same Schema.
+
+    **Single source of truth in practice:** Without Schema-driven design, input validation lives in one file, permission checks in another, and API documentation is written by hand. Changing one parameter requires synchronized updates in three places. Schema-driven design eliminates that root cause of inconsistency — modify one Schema and it takes effect globally.
+  </Tab>
+
+  <Tab title="Progressive permissions">
+    The permission system is divided into four stages, each able to short-circuit:
+
+    1. `validateInput` — input validation
+    2. `checkPermissions` — permission check
+    3. PreToolUse hooks — pre-execution interception
+    4. `canUseTool` — user confirmation
+
+    Requests that fail an early stage never enter a later one. This **Fail Fast** design means invalid input never wastes time in permission rules, and explicitly denied operations never trigger a user confirmation dialog.
+  </Tab>
+
+  <Tab title="Streaming first">
+    From model responses to tool results, all data flows through `AsyncGenerator`'s `yield`. Consumers process messages one by one without waiting for the entire turn to complete — making real-time UI updates and SDK streaming possible.
+  </Tab>
+
+  <Tab title="Pluggable extensions">
+    The hook system provides extension points at over twenty lifecycle nodes, from `SessionStart` to `PostToolUse`, from `PreCompact` to `Stop`. Each hook is an independent shell command or HTTP endpoint that interacts with the Harness through a standardized JSON input/output protocol.
+  </Tab>
+</Tabs>
+
+### When to use an Agent Harness vs. a simple API call
+
+Not every scenario needs a full Agent Harness. The decision hinges on three dimensions:
+
+| Dimension | Simple API call | Agent Harness |
+|-----------|----------------|---------------|
+| Interaction turns | Single request-response | Multi-turn autonomous loop |
+| Tool requirements | None or Function Calling only | Multiple tools with permission control |
+| Context management | Manual prompt assembly | Automatic compression and memory extraction |
+| Error recovery | Retry | Multi-layer recovery: circuit breaker, fallback, compression |
+| Cost sensitivity | Low (single call) | High (accumulated over long sessions) |
+| Security requirements | Low (no side effects) | High (file operations, command execution) |
+
+Consider the Agent Harness pattern when your system needs to:
+
+- Decide its next action based on intermediate results (autonomous loop)
+- Perform side-effect operations — file system access, code execution, network requests
+- Sustain conversations across dozens or hundreds of turns
+- Maintain consistent behavior across CLI, IDE, and SDK environments
+- Enforce fine-grained cost control and token budget management
+- Provide observability into decision processes and resource consumption
+
+<Tip>
+  **Decision rule of thumb:** If your system only needs the LLM to perform "input → output" transformations (translation, summarization, classification), use a simple API call. If your system needs the LLM to run an "observe → think → act → observe again" loop, use an Agent Harness.
+</Tip>
+
+### Runtime selection
+
+<CardGroup cols={2}>
+  <Card title="Bun" icon="bolt">
+    **Best for CLI tools.** Cold start is roughly one-third of Node.js. Runs `.ts` files directly with no pre-compilation step. `bun:bundle` provides compile-time feature flags that eliminate unused code paths from build output entirely.
+  </Card>
+  <Card title="Node.js" icon="server">
+    **Best for existing server infrastructure.** Mature package ecosystem, widest deployment support. TypeScript requires a compilation step, but otherwise the Harness code in this chapter is fully compatible.
+  </Card>
+  <Card title="Python" icon="code">
+    **Best for data science and ML integrations.** Wide package availability and strong ML tooling. Weaker than TypeScript in static type safety and async ergonomics for Harness-style architectures.
+  </Card>
+  <Card title="Compile-time feature flags" icon="flag">
+    Code wrapped in `feature('X')` is completely absent from Bun build output when disabled — no branch prediction penalty. For progressive releases in production, this pattern is worth adopting regardless of runtime.
+  </Card>
+</CardGroup>
+
+---
+
+## Six-step implementation roadmap
+
+Building an Agent Harness is an incremental process. Each step below builds on the previous one, producing a minimal runnable Harness at the end.
+
+<Warning>
+  Don't treat these six steps as a linear waterfall. In practice you'll iterate: implementing the permission pipeline may require going back to adjust the tool system's interface; implementing context management may require adjusting the dialog loop's state structure. The steps provide an ordered learning path, not a rigid development sequence.
+</Warning>
+
+<Steps>
+  <Step title="Dialog loop">
+    The dialog loop is the heart of any Agent Harness. Claude Code's core query function is an `AsyncGenerator`. The key design insight is a `while(true)` loop with state encapsulated in a single `state` object — easy to debug, easy to abort, and safe from call-stack overflow.
+
+    First, define your core types:
+
+    ```typescript
+    // types.ts
+    export interface Message {
+      role: 'system' | 'user' | 'assistant'
+      content: string | ContentBlock[]
+    }
+
+    export interface ContentBlock {
+      type: 'text' | 'tool_use' | 'tool_result'
+      text?: string
+      id?: string
+      name?: string
+      input?: Record<string, unknown>
+      content?: string | ContentBlock[]
+      is_error?: boolean
+      tool_use_id?: string
+    }
+
+    export interface StreamEvent {
+      type: 'assistant' | 'tool_results' | 'error' | 'complete'
+      content?: unknown
+    }
+
+    export interface LoopState {
+      messages: Message[]
+      turnCount: number
+      abortController: AbortController
+    }
+    ```
+
+    Then implement the main loop. Note the state-object pattern: loop state lives in a single `state` variable, and each `continue` site writes a new object — matching Claude Code's `const next: State = { ... }` pattern:
+
+    ```typescript
+    // agentLoop.ts
+    import type { Tool } from './toolSystem'
+
+    interface AgentDeps {
+      callModel: (
+        messages: Message[],
+        tools: Tool[],
+        signal: AbortSignal,
+      ) => AsyncGenerator<ContentBlock[]>
+      uuid: () => string
+    }
+
+    export async function* agentLoop(
+      messages: Message[],
+      tools: Tool[],
+      deps: AgentDeps,
+    ): AsyncGenerator<StreamEvent, { reason: string }> {
+      let state: LoopState = {
+        messages,
+        turnCount: 0,
+        abortController: new AbortController(),
+      }
+
+      while (true) {
+        const { messages: currentMessages, abortController } = state
+
+        const assistantBlocks: ContentBlock[] = []
+        const toolUseBlocks: ContentBlock[] = []
+
+        try {
+          for await (const block of deps.callModel(
+            currentMessages,
+            tools,
+            abortController.signal,
+          )) {
+            assistantBlocks.push(block)
+            if (block.type === 'tool_use') toolUseBlocks.push(block)
+            yield { type: 'assistant' as const, content: block }
+          }
+        } catch (error) {
+          yield { type: 'error', content: String(error) }
+          return { reason: 'model_error' }
+        }
+
+        // No tool calls — conversation complete
+        if (toolUseBlocks.length === 0) {
+          yield { type: 'complete' }
+          return { reason: 'completed' }
+        }
+
+        // Execute tools and collect results
+        const toolResults: ContentBlock[] = []
+        for (const toolCall of toolUseBlocks) {
+          const tool = tools.find(t => t.name === toolCall.name)
+          if (!tool) {
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolCall.id,
+              content: `Unknown tool: ${toolCall.name}`,
+              is_error: true,
+            })
+            continue
+          }
+          try {
+            const result = await tool.execute(toolCall.input ?? {})
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolCall.id,
+              content: JSON.stringify(result),
+            })
+          } catch (error) {
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolCall.id,
+              content: `Tool error: ${error}`,
+              is_error: true,
+            })
+          }
+          yield { type: 'tool_results', content: toolResults }
+        }
+
+        // Update state and continue
+        state = {
+          ...state,
+          messages: [
+            ...currentMessages,
+            { role: 'assistant', content: assistantBlocks },
+            { role: 'user', content: toolResults },
+          ],
+          turnCount: state.turnCount + 1,
+        }
+      }
+    }
+    ```
+
+    **Before using this in production, add:**
+
+    - **Maximum turn limit** — prevents infinite loops from consuming tokens (`maxTurns` parameter)
+    - **Abort mechanism** — supports user cancellation via `AbortController`
+    - **Error retry** — exponential backoff with fallback strategy for model call failures
+    - **Usage tracking** — token consumption per turn for budget ceiling checks
+  </Step>
+
+  <Step title="Tool system">
+    Claude Code's tool system uses a `buildTool` factory function so each tool only defines its unique parts, while common behavior is provided by defaults.
+
+    ```typescript
+    // toolSystem.ts
+    import { z } from 'zod'
+
+    export interface Tool {
+      name: string
+      description: string
+      inputSchema: z.ZodType<{ [key: string]: unknown }>
+      execute: (input: Record<string, unknown>) => Promise<unknown>
+      isEnabled: () => boolean
+      isReadOnly: (input: unknown) => boolean
+      isConcurrencySafe: (input: unknown) => boolean
+      isDestructive: (input: unknown) => boolean
+      checkPermissions: (
+        input: Record<string, unknown>,
+      ) => Promise<{ allowed: boolean; reason?: string }>
+    }
+
+    // Fail-closed defaults — matches Claude Code's TOOL_DEFAULTS
+    const TOOL_DEFAULTS = {
+      isEnabled: () => true,
+      isReadOnly: () => false,        // Assume writes
+      isConcurrencySafe: () => false, // Assume not safe
+      isDestructive: () => false,
+      checkPermissions: async () => ({ allowed: true }),
+    }
+
+    type ToolDef = Partial<typeof TOOL_DEFAULTS> &
+      Omit<Tool, keyof typeof TOOL_DEFAULTS>
+
+    export function buildTool(def: ToolDef): Tool {
+      return { ...TOOL_DEFAULTS, ...def } as Tool
+    }
+    ```
+
+    Example — a file read tool that explicitly declares its safety:
+
+    ```typescript
+    const readFileTool = buildTool({
+      name: 'read_file',
+      description: 'Read the contents of a file',
+      inputSchema: z.object({
+        path: z.string().describe('Absolute path to the file'),
+        offset: z.number().optional().describe('Line number to start reading'),
+        limit: z.number().optional().describe('Maximum lines to read'),
+      }),
+      isReadOnly: () => true,
+      isConcurrencySafe: () => true,
+      async execute(input) {
+        const { path, offset, limit } = input as {
+          path: string; offset?: number; limit?: number
+        }
+        const fs = await import('fs/promises')
+        const content = await fs.readFile(path, 'utf-8')
+        const lines = content.split('\n')
+        const start = offset ?? 0
+        const end = limit ? start + limit : lines.length
+        return lines.slice(start, end).join('\n')
+      },
+    })
+    ```
+
+    The essence of `buildTool` is **fail-closed defaults**: `isConcurrencySafe` and `isReadOnly` both default to `false`. The system assumes the most dangerous scenario for every new tool until it explicitly declares otherwise.
+
+    | Strategy | Fail-closed (Claude Code) | Fail-open |
+    |----------|--------------------------|-----------|
+    | Default assumption | Tool is unsafe | Tool is safe |
+    | New tool behavior | Sequential, confirmation required | Parallel, auto-approved |
+    | Risk of missing annotations | Slightly lower performance | Security vulnerability |
+    | Suitable for | Production environments | Development / experimentation |
+
+    <Tip>
+      When developing new tools, start with fail-closed defaults. After confirming the tool behaves correctly, progressively add safety annotations (`isReadOnly`, `isConcurrencySafe`). This avoids the "mark as safe first, discover it's unsafe later" rollback.
+    </Tip>
+  </Step>
+
+  <Step title="Permission pipeline">
+    Claude Code's permission check is a four-stage pipeline where each stage can short-circuit, preventing unnecessary work downstream.
+
+    ```typescript
+    // permissions.ts
+    export type PermissionDecision =
+      | { allowed: true }
+      | { allowed: false; reason: string }
+
+    export async function checkToolPermission(
+      tool: Tool,
+      input: Record<string, unknown>,
+      context: PermissionContext,
+    ): Promise<PermissionDecision> {
+      // Stage 1: Tool's own input validation
+      if (tool.validateInput) {
+        const validation = await tool.validateInput(input, context)
+        if (!validation.result)
+          return { allowed: false, reason: validation.message }
+      }
+
+      // Stage 2: Tool's own permission check
+      const toolPermission = await tool.checkPermissions(input)
+      if (!toolPermission.allowed)
+        return { allowed: false, reason: toolPermission.reason ?? 'Denied by tool' }
+
+      // Stage 3: User-configured rule matching
+      const ruleDecision = matchPermissionRules(tool.name, input, context.rules)
+      if (ruleDecision !== 'unknown')
+        return ruleDecision === 'allow'
+          ? { allowed: true }
+          : { allowed: false, reason: `Blocked by ${ruleDecision} rule` }
+
+      // Stage 4: Interactive user confirmation (interactive mode only)
+      if (context.mode === 'interactive') {
+        const userChoice = await context.promptUser(`Allow ${tool.name} to execute?`)
+        return userChoice
+          ? { allowed: true }
+          : { allowed: false, reason: 'User denied' }
+      }
+
+      return { allowed: false, reason: 'Non-interactive: no matching rule' }
+    }
+    ```
+
+    **Production enhancements to plan for:**
+
+    - **Audit logging** — record tool name, input summary, decision result, and reason for every permission decision
+    - **Dynamic rule updates** — add or remove permission rules at runtime without restarting the Agent
+    - **Permission caching** — cache decisions for frequently called read-only tools to reduce latency
+    - **Role-based access control** — different user roles receive different permission rule sets in multi-user deployments
+  </Step>
+
+  <Step title="Context management">
+    Long conversations inevitably hit token limits. Claude Code employs a **progressive compression strategy** with multiple tiers, each triggered at a different usage threshold.
+
+    ```typescript
+    // contextManager.ts
+    export interface CompressionStrategy {
+      name: string
+      shouldTrigger: (tokenCount: number, limit: number) => boolean
+      compress: (messages: Message[]) => Promise<Message[]>
+    }
+
+    // Strategy 1: History snipping (cheapest)
+    const snipStrategy: CompressionStrategy = {
+      name: 'snip',
+      shouldTrigger: (count, limit) => count > limit * 0.7,
+      async compress(messages) {
+        const systemMsgs = messages.filter(m => m.role === 'system')
+        const recentMsgs = messages.slice(-20)
+        return [...systemMsgs, ...recentMsgs]
+      },
+    }
+
+    // Strategy 2: Summary compression (medium cost)
+    const summaryStrategy: CompressionStrategy = {
+      name: 'summary',
+      shouldTrigger: (count, limit) => count > limit * 0.9,
+      async compress(messages) {
+        const summary = await generateSummary(messages)
+        return [
+          messages[0], // System message
+          { role: 'user', content: `[Conversation summary]\n${summary}` },
+        ]
+      },
+    }
+
+    export class ContextManager {
+      private strategies: CompressionStrategy[] = [snipStrategy, summaryStrategy]
+
+      async manageContext(
+        messages: Message[],
+        tokenCount: number,
+        tokenLimit: number,
+      ): Promise<{ messages: Message[]; wasCompressed: boolean }> {
+        for (const strategy of this.strategies) {
+          if (strategy.shouldTrigger(tokenCount, tokenLimit)) {
+            const compressed = await strategy.compress(messages)
+            return { messages: compressed, wasCompressed: true }
+          }
+        }
+        return { messages, wasCompressed: false }
+      }
+    }
+    ```
+
+    | Strategy | Token savings | Information loss | Best for |
+    |----------|-------------|-----------------|----------|
+    | Snip | 20–40% | High | Quick space release, non-critical conversations |
+    | Micro-compress | 30–50% | Medium | Preserve structure, compress tool results |
+    | Summary | 70–90% | Low (lossy) | Long conversations where key facts must survive |
+
+    <Note>
+      Information loss is relative. Snip discards complete tool results but preserves conversation structure. Summary compression preserves semantic information but loses original phrasing. Choose based on what information matters most for the current task — debug log output vs. overall design decisions may have very different retention priorities.
+    </Note>
+  </Step>
+
+  <Step title="Memory system">
+    The memory system extracts high-value facts from conversations, stores them persistently, and injects only the most relevant fragments on future turns.
+
+    ```typescript
+    // memory.ts
+    export interface MemoryEntry {
+      content: string
+      source: 'extracted' | 'explicit' | 'project_file'
+      timestamp: number
+      relevance: number
+    }
+
+    export class MemoryStore {
+      private store: Map<string, MemoryEntry> = new Map()
+
+      async extractAndStore(messages: Message[]): Promise<void> {
+        const lastExchange = messages.slice(-4)
+        const extraction = await extractKeyFacts(lastExchange)
+        for (const fact of extraction.facts) {
+          this.store.set(fact.key, {
+            content: fact.value,
+            source: 'extracted',
+            timestamp: Date.now(),
+            relevance: fact.relevance,
+          })
+        }
+      }
+
+      getRelevantMemories(query: string, limit = 5): MemoryEntry[] {
+        return Array.from(this.store.values())
+          .filter(m => m.relevance > 0.3)
+          .sort((a, b) => b.relevance - a.relevance)
+          .slice(0, limit)
+      }
+    }
+    ```
+
+    The memory system faces three core design challenges:
+
+    <AccordionGroup>
+      <Accordion title="What to extract?">
+        Not all conversation content is worth remembering. **High-value memories** include user preferences ("I prefer Jest over Vitest"), project conventions ("this project uses camelCase naming"), and important decisions ("chose Redis over Memcached for caching"). **Low-value memories** include temporary debug output and intermediate step file contents.
+      </Accordion>
+      <Accordion title="How long to store?">
+        Memory has a decay curve. Context from a week ago may no longer be relevant — the code may have been rewritten entirely. A robust memory system determines retention time based on a memory's timeliness and reference frequency.
+      </Accordion>
+      <Accordion title="When to inject?">
+        Memories should not be injected in full on every request — that wastes tokens and dilutes key information. Inject selectively based on relevance to the current conversation, choosing only the most relevant fragments for each turn.
+      </Accordion>
+    </AccordionGroup>
+  </Step>
+
+  <Step title="Hook system">
+    The hook system is the extension layer of the Agent Harness. Claude Code supports over twenty hook events, each an independent shell command. Here is a minimal but complete implementation:
+
+    ```typescript
+    // hooks.ts
+    export type HookEvent =
+      | 'pre_tool_use'
+      | 'post_tool_use'
+      | 'session_start'
+      | 'session_end'
+      | 'stop'
+
+    export interface HookConfig {
+      event: HookEvent
+      command: string
+      matcher?: string // Tool name matching pattern
+    }
+
+    export interface HookResult {
+      outcome: 'success' | 'blocking' | 'error'
+      decision?: 'approve' | 'block'
+      reason?: string
+      updatedInput?: Record<string, unknown>
+    }
+
+    export class HookRunner {
+      constructor(private config: HookConfig[]) {}
+
+      async runHooks(
+        event: HookEvent,
+        input: Record<string, unknown>,
+        toolName?: string,
+      ): Promise<HookResult[]> {
+        const matching = this.config.filter(h => {
+          if (h.event !== event) return false
+          if (h.matcher && toolName && !h.matcher.includes(toolName)) return false
+          return true
+        })
+
+        const results: HookResult[] = []
+        for (const hook of matching) {
+          const result = await this.executeHook(hook, input)
+          results.push(result)
+          if (result.outcome === 'blocking') break // Short-circuit on block
+        }
+        return results
+      }
+
+      private async executeHook(
+        hook: HookConfig,
+        input: Record<string, unknown>,
+      ): Promise<HookResult> {
+        const { spawn } = await import('child_process')
+        return new Promise(resolve => {
+          const child = spawn(hook.command, [], {
+            shell: true,
+            env: { ...process.env, HOOK_INPUT: JSON.stringify(input) },
+            timeout: 10_000,
+          })
+          let stdout = ''
+          child.stdout?.on('data', d => (stdout += d))
+          child.on('close', code => {
+            if (code !== 0) {
+              resolve({ outcome: code === 2 ? 'blocking' : 'error', reason: stdout })
+            } else {
+              resolve({ outcome: 'success' })
+            }
+          })
+        })
+      }
+    }
+    ```
+
+    **Key production considerations:**
+
+    - **Timeout management** — Claude Code uses a 10-second timeout. Timed-out hooks are treated as errors, not blocking events, so a slow hook never stalls the entire dialog loop.
+    - **Error tolerance** — Hook failures should not stop the Agent. Hooks are advisors, not commanders. Their output influences decisions but does not control flow.
+    - **Security isolation** — Hook commands execute in separate processes, isolated from the Agent's main process. This prevents malicious hooks from modifying global variables or hijacking the module system.
+    - **Audit trail** — Record each hook's execution time, return code, and output for debugging and compliance auditing.
+  </Step>
+</Steps>
+
+---
+
+## Circular dependency resolution
+
+In a codebase with over sixty tools and hundreds of modules, circular dependencies are the number one architecture killer. Claude Code employs two main strategies to break cycles.
+
+<CardGroup cols={2}>
+  <Card title="Lazy require pattern" icon="clock">
+    Conditional modules are loaded at runtime via `require()`, combined with feature flags, so unused modules are never loaded. This defers imports from compile time to runtime, and ensures that optional heavy dependencies are only resolved when actually needed.
+  </Card>
+  <Card title="Centralized type exports" icon="arrow-right-arrow-left">
+    Import types from a centralized location rather than from implementation modules. Tool files get type signatures without importing the entire permission system — decoupling type definitions from runtime implementations.
+  </Card>
+</CardGroup>
+
+### Diagnosing circular dependencies
+
+Symptoms that your project is affected:
+
+- **Startup time grows non-linearly with module count** — module loading becomes a directed graph requiring depth-first traversal
+- **`undefined` surprises** — imported values are `undefined` in certain code paths because the module hasn't finished initializing
+- **Modifying one file triggers mass recompilation** — TypeScript's incremental compilation degrades in the presence of cycles
+
+### Breaking cycles: a systematic methodology
+
+```typescript
+// Step 1: Visualize the graph
+// npx madge --circular --extensions ts src/
+
+// Step 2: For each cycle, identify the root cause:
+// - Type dependency vs. runtime dependency?
+// - Can it be broken through centralized type exports?
+// - Can it be broken through lazy require?
+// - Does it need a mediator module?
+
+// Step 3: Break one cycle at a time — never batch
+
+// Step 4: Add CI enforcement to prevent regression
+// npx madge --circular --extensions ts src/ && echo "No cycles"
+```
+
+<Warning>
+  Break one cycle per iteration, then re-verify. Batching multiple cycle fixes at once makes it very hard to diagnose when you introduce a new cycle while resolving an old one.
+</Warning>
+
+---
+
+## Four-layer observability system
+
+Observability for a production Agent Harness goes beyond "logging." It requires a systematic, layered design.
+
+<Tabs>
+  <Tab title="Layer 1: Structured logs">
+    Every critical operation outputs structured log entries. Record the operation type, duration, input summary, and output summary — and include correlation fields so you can join records later.
+
+    ```json
+    {
+      "event": "tool_execution",
+      "tool": "read_file",
+      "duration_ms": 45,
+      "input_size": 128,
+      "output_size": 15234,
+      "cache_hit": true,
+      "query_chain_id": "abc123",
+      "turn_number": 5
+    }
+    ```
+
+    Output to `stderr` or a log file in JSON Lines format. **Effort: low. Value: high.** This is the foundation every other layer builds on.
+  </Tab>
+
+  <Tab title="Layer 2: Metric aggregation">
+    Aggregate structured logs into time-series metrics for dashboards and alerting. Key metrics to track:
+
+    | Metric | Description |
+    |--------|-------------|
+    | Latency distribution | P50/P95/P99 for model calls and tool execution per turn |
+    | Token budget | Input/output token consumption trends, compression frequency |
+    | Error rate | Failure rates by error type: model errors, tool errors, permission denials |
+    | Behavioral metrics | Avg tool calls per turn, avg turns to completion, user interruption rate |
+
+    **Recommended stack:** Prometheus for collection, Grafana for dashboards. **Effort: medium. Value: medium.**
+  </Tab>
+
+  <Tab title="Layer 3: Distributed tracing">
+    In multi-Agent scenarios, a single user request may trigger multiple sub-Agents. Distributed tracing links all related operations through a unique `query_chain_id`.
+
+    ```typescript
+    // Assign trace context at session start
+    const traceId = crypto.randomUUID()
+    const spanId = crypto.randomUUID()
+
+    // Propagate through every tool call and sub-agent invocation
+    const span = {
+      trace_id: traceId,
+      span_id: spanId,
+      parent_span_id: parentSpanId,
+      operation: 'tool_execution',
+      tool: toolName,
+      start_time: Date.now(),
+    }
+    ```
+
+    **Recommended stack:** OpenTelemetry SDK for instrumentation, Jaeger or Honeycomb for visualization. **Effort: high. Value: high.**
+  </Tab>
+
+  <Tab title="Layer 4: Anomaly detection">
+    Anomaly detection based on historical baselines automatically surfaces abnormal behavior patterns:
+
+    - **Abnormal increase in tool calls per turn** — the Agent may be stuck in a loop
+    - **Sudden spike in token consumption** — a tool may have returned unexpectedly large data
+    - **Sudden rise in error rate** — an external API may be degraded
+
+    Establish normal behavior baselines first, then configure automated alerts and post-mortem analysis pipelines. **Effort: high. Value: incremental (build last).**
+  </Tab>
+</Tabs>
+
+---
+
+## Security threat model
+
+Agent systems face threats fundamentally different from traditional applications. Traditional application threats come from external attackers injecting malicious input. Agent system threats also include the LLM itself — the model may execute unintended operations due to prompt injection.
+
+| Threat | Description | Defense |
+|--------|-------------|---------|
+| Prompt injection | Malicious content injected via files or web pages | Tool result isolation + permission checks |
+| Tool abuse | Model calls tools it shouldn't | Permission pipeline + user confirmation |
+| Resource exhaustion | Infinite loops consuming tokens or API quotas | Budget ceiling + maximum turn limit |
+| Data leakage | Tool results contain sensitive information | Input sanitization + workspace trust check |
+| Supply chain attack | Malicious hooks or MCP servers | Hook allowlist + sandboxed execution |
+
+### Security audit checklist
+
+Before deploying any Agent Harness to production, verify:
+
+<AccordionGroup>
+  <Accordion title="Tool annotations">
+    - Every tool has correct `isReadOnly`, `isDestructive`, and `isConcurrencySafe` annotations
+    - New tools start with fail-closed defaults and annotations are added only after security review
+    - Tool definitions are immutable at runtime (`readonly Tool[]`) — no code can secretly add or remove tools
+  </Accordion>
+  <Accordion title="Permission pipeline integrity">
+    - The permission pipeline completes all checks before tool execution — no bypass paths exist
+    - All permission decisions produce audit log entries (tool name, input summary, decision result, reason)
+    - Role-based access control is enforced in multi-user deployments
+  </Accordion>
+  <Accordion title="Budget and resource controls">
+    - Budget ceiling (`maxBudgetUsd` or equivalent) is checked on every loop turn, not just at session end
+    - A maximum turn limit is enforced to prevent infinite loops
+    - The circuit breaker threshold is set conservatively (Claude Code uses 3 consecutive failures)
+  </Accordion>
+  <Accordion title="Input and output hygiene">
+    - Sensitive information in tool results is sanitized before passing to the model
+    - Sanitized input is passed to observers; the original API-bound input is left unmodified (to preserve prompt caching)
+    - Tool result size is bounded to prevent unexpected token spikes
+  </Accordion>
+  <Accordion title="Hook and extension security">
+    - Hook commands execute in trusted workspaces only; untrusted workspaces are automatically skipped
+    - Hook allowlist is enforced — only pre-approved commands can be registered
+    - Sub-Agent permissions do not exceed the parent Agent's permission scope
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Technology stack recommendations
+
+<CardGroup cols={2}>
+  <Card title="Bun runtime" icon="bolt">
+    Fast cold start, native TypeScript, and compile-time feature flags via `bun:bundle`. The default choice for CLI-first Agent Harnesses.
+  </Card>
+  <Card title="Zod v4" icon="shield-check">
+    Schema-driven tool definitions, automatic input validation, and generated API documentation — all from one source of truth. The `z.object()` + `z.describe()` pattern maps directly to Claude's tool input schema format.
+  </Card>
+  <Card title="React / Ink" icon="display">
+    Terminal UI rendering for CLI environments. Ink uses the React component model to render interactive terminal output, making real-time streaming display straightforward to implement.
+  </Card>
+  <Card title="OpenTelemetry" icon="chart-line">
+    Vendor-neutral distributed tracing and metrics. Instrument once with the OTel SDK and export to Jaeger, Honeycomb, Datadog, or any compatible backend.
+  </Card>
+  <Card title="Prometheus + Grafana" icon="gauge">
+    Time-series metrics collection and dashboarding. Define P50/P95/P99 latency metrics and error-rate alerts with Prometheus; visualize in Grafana.
+  </Card>
+  <Card title="madge / dependency-cruiser" icon="circle-nodes">
+    Visualize and enforce module dependency rules. Add `madge --circular` to CI to prevent new circular dependencies from reaching main.
+  </Card>
+</CardGroup>
+
+---
+
+## Common pitfalls and how to avoid them
+
+<AccordionGroup>
+  <Accordion title="Recursion instead of loops" icon="arrow-rotate-right">
+    **Pitfall:** Implementing the dialog loop as recursive calls, which leads to call-stack overflow on long conversations and makes state recovery complex.
+
+    **Solution:** Use `while(true)` with a state object. State recovery becomes a simple variable reassignment. Abort checking is a single point at the top of the loop. Debugging requires only one breakpoint.
+  </Accordion>
+
+  <Accordion title="Fail-open tool defaults" icon="unlock">
+    **Pitfall:** New tools auto-approve concurrent execution or skip confirmation dialogs because defaults are permissive.
+
+    **Solution:** Default `isConcurrencySafe` and `isReadOnly` to `false`. Tools must explicitly declare their safety. Claude Code's source code comments make this explicit: "assume not safe" and "assume writes."
+  </Accordion>
+
+  <Accordion title="Circuit breaker threshold too high" icon="circle-stop">
+    **Pitfall:** Setting the consecutive failure threshold to a large number (e.g., 100), effectively disabling the circuit breaker. The system retries indefinitely during API degradation, burning tokens and API quota.
+
+    **Solution:** Use a low threshold — Claude Code chose 3 based on observational data. Three consecutive failures almost always indicate a systemic issue, not transient noise. After the threshold is hit, switch to a fallback model or exit gracefully.
+  </Accordion>
+
+  <Accordion title="Circular dependency blind spots" icon="circle-exclamation">
+    **Pitfall:** Not discovering circular dependencies until they cause subtle `undefined` import bugs in production, or until TypeScript incremental compilation starts rebuilding the entire project on every change.
+
+    **Solution:** Add `madge --circular` to your CI pipeline from day one. Fix cycles one at a time using centralized type exports or lazy `require()`. Never let a cycle land on the main branch.
+  </Accordion>
+
+  <Accordion title="Environment checks in core logic" icon="code-branch">
+    **Pitfall:** Core loop code contains `if (isCLI) { ... } else if (isSDK) { ... }` branches, making it impossible to test the core in isolation and coupling platform logic to business logic.
+
+    **Solution:** Encapsulate all environment differences in adapter implementations of the `AgentDeps` interface. The core loop never knows what environment it's running in. Tests inject mock implementations; CLI, SDK, and server adapters inject real ones.
+  </Accordion>
+
+  <Accordion title="No observability until something breaks" icon="eye-slash">
+    **Pitfall:** Shipping without structured logs or metrics, then discovering that debugging production issues is guesswork — you can't tell which tool is slow, which error type is spiking, or where tokens are being consumed.
+
+    **Solution:** Add structured JSON logging to every tool execution and loop turn from the very first release. This costs almost nothing to implement but provides the foundation for every other observability layer. An Agent system without observability is a black box.
+  </Accordion>
+
+  <Accordion title="Compression strategy that discards the wrong information" icon="scissors">
+    **Pitfall:** Applying the same compression strategy uniformly regardless of conversation type — for example, snipping recent tool results during a debugging session where those results are the most critical context.
+
+    **Solution:** Choose compression strategy based on what information matters most for the current task. If the user is debugging a complex bug, tool results (log output) may be the least expendable. If the user is performing a refactoring, overall design decisions matter more than intermediate steps. Make compression configurable per session type.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key takeaways
+
+1. **Loop state pattern** — `while(true)` + `State` object + `continue` is easier to debug and maintain than recursive calls. Three reasons loops beat recursion: state recovery is more natural, abort is more controllable, and debugging is more intuitive.
+
+2. **Factory function + fail-closed defaults** — `buildTool` keeps tool definitions concise. Defaults choose the most conservative strategy (unsafe, has side effects, requires confirmation). Tools explicitly override to declare safety, not the other way around.
+
+3. **Dependency injection isolates I/O** — The `AgentDeps` pattern abstracts all external dependencies into injectable interfaces. The core principle: "the core doesn't know where it's running." Environment differences are encapsulated in adapters, not handled through conditional logic in core code.
+
+4. **Progressive compression** — Multi-tier compression strategies (snipping, micro-compression, summary) trigger progressively based on token usage rate. Information loss is relative — the key is preserving what is most valuable for the current task.
+
+5. **Circuit breaker protection** — Consecutive failure counting, maximum recovery attempts, and fallback strategies ensure the Agent degrades gracefully under persistent errors rather than looping indefinitely. Three consecutive failures is a well-calibrated threshold: beyond that point, retries are almost never productive.
+
+6. **Feature flag-driven progressive releases** — Three-tier flag strategy (compile-time, runtime config, remote feature flags) suits different release scenarios. Compile-time flags eliminate disabled code paths entirely from build output.
+
+7. **Security defense in depth** — From tool-level annotations (`isDestructive`) to system-level controls (workspace trust, budget ceiling), each layer provides independent security guarantees. The LLM's output itself is an attack vector — design defenses at every layer.
+
+8. **Observability is the cornerstone of production readiness** — From structured logs to aggregated metrics to distributed tracing, the four observability layers provide the foundation for debugging, optimization, and compliance. Implement Layer 1 (structured logs) on day one; add subsequent layers as the system matures.

@@ -1,97 +1,65 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Yù Yú: Decoding Agent Harness"
+description: "A deep architectural analysis of Claude Code — dissecting the Agent Harness skeleton across 15 chapters, from the dialog loop to building your own AI agent runtime."
 ---
 
-## Setting up
+## What is this book?
 
-Get your documentation site up and running in minutes.
+*"Of all instruments, the chariot demands the most hands to build."* — *Kǎo Gōng Jì* (Rites of Zhou, c. 300 BC)
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+While everyone teaches you how to **use** AI Agents — **this book dissects one.**
 
-## Make it yours
+This is a 420,000-character technical book performing a deep architectural analysis of Claude Code. Rather than a usage tutorial or prompt guide, it systematically examines the **Agent Harness** — the engineering runtime that makes an LLM truly operational in production.
 
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Read the Foreword" icon="book-open" href="/foreword">
+    Understand why this book was written and how to navigate it
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Part 1: Foundations" icon="building" href="/part1/01-new-paradigm">
+    Start with the new paradigm of Agent programming
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Quick Reference" icon="table" href="/appendix/b-tool-inventory">
+    Jump straight to the tool inventory, feature flags, or glossary
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Build Your Own Harness" icon="hammer" href="/part4/15-build-your-own-harness">
+    Skip to the hands-on implementation roadmap
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## The four parts
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Part 1: Foundations — Building Mental Models">
+    Chapters 1–4 establish the core paradigm shift from Copilot to autonomous agents. You'll understand the `while(true)` async generator loop, the `Tool<I,O,P>` protocol, and the four-stage permission pipeline.
+  </Step>
+  <Step title="Part 2: Core Systems — Deep Into Subsystems">
+    Chapters 5–8 dissect the four major subsystems: configuration priority chains, the memory system, context compression algorithms, and the lifecycle hook system with 26 events.
+  </Step>
+  <Step title="Part 3: Advanced Patterns — Composition and Extension">
+    Chapters 9–12 explore sub-agent Fork inheritance, multi-agent coordinator patterns, the skill plugin architecture, and MCP protocol integration across 8 transport types.
+  </Step>
+  <Step title="Part 4: Engineering Practice — From Principles to Construction">
+    Chapters 13–15 cover streaming architecture performance (160ms → 65ms startup), Plan Mode structured workflows, and a six-step roadmap for building your own Agent Harness.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## How to read this book
 
-## Need inspiration?
+<Tabs>
+  <Tab title="Short on time">
+    Read **Chapter 01 → 02 → 04 → 15** for the core cognitive model and hands-on skills in the most efficient path.
+  </Tab>
+  <Tab title="Experienced engineer">
+    Jump directly to **Part 2 + Part 3** for subsystem deep-dives. Backtrack to Part 1 only when you hit a concept gap.
+  </Tab>
+  <Tab title="Systematic study">
+    Read cover to cover, completing exercises in each chapter. Budget **2–3 weeks** to reach Chapter 15.
+  </Tab>
+  <Tab title="Just need reference">
+    Go straight to the [Appendices](/appendix/a-architecture-map): Architecture Map (A), Tool Inventory (B), Feature Flags (C), or Glossary (D).
+  </Tab>
+</Tabs>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+This book is based on architectural analysis of Claude Code's public documentation and product behavior. No unpublished or unauthorized source code was used. Claude Code is a product of Anthropic PBC. This book is not affiliated with, authorized by, or representative of Anthropic.
+</Note>

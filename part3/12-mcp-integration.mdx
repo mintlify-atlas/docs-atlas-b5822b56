@@ -1,0 +1,514 @@
+---
+title: "MCP Integration & External Protocols"
+description: "How Claude Code integrates with the Model Context Protocol — covering the 8 transport protocols, five-state connection lifecycle, three-part tool naming, the Bridge bidirectional communication system, and enterprise security configuration."
+---
+
+MCP (Model Context Protocol) is the "USB-C port" of the AI world. It defines an open standard protocol that allows any AI application to connect to any data source or tool in a unified way. Tool developers implement an MCP server once and make it usable by all MCP-compatible AI applications. AI application developers implement an MCP client once and gain access to the entire MCP ecosystem.
+
+---
+
+## Why MCP: the fragmented integration problem
+
+Before MCP, every AI application integrated external tools in its own proprietary way. A database vendor wanting to expose data to multiple AI tools had to write a separate adapter for each platform — one for Claude, one for ChatGPT, one for Cursor — an era of proprietary charging ports before the USB standard arrived.
+
+MCP solves this through three core design principles:
+
+<CardGroup cols={3}>
+  <Card title="Protocol as contract" icon="file-contract">
+    Strict message formats and capability declaration mechanisms. Servers declare what tools, resources, and prompt templates they provide; clients retrieve this through standardized requests. Both parties collaborate without knowing each other's internal implementation.
+  </Card>
+  <Card title="Transport agnostic" icon="shuffle">
+    The protocol is not bound to any specific network transport. The same MCP server can provide services through stdio, HTTP, WebSocket, and other methods — running locally for performance or remotely for centralized management.
+  </Card>
+  <Card title="Security by design" icon="shield">
+    Security strategies integrated at every layer: from capability negotiation during connection establishment, to permission checks during tool invocation, to enterprise-level approval controls. Default distrust at every boundary.
+  </Card>
+</CardGroup>
+
+Once MCP tools are mapped to internal Claude Code `Tool` objects, they fully integrate into Claude Code's existing systems — going through the same four-stage permission pipeline checks, participating in the same concurrency scheduling strategies, and interceptable through the hook system.
+
+---
+
+## The 8 transport protocols
+
+Claude Code supports 8 MCP transport protocols, each optimized for different deployment scenarios and network topologies:
+
+<Tabs>
+  <Tab title="stdio">
+    ### stdio — Local inter-process pipes
+
+    The most common and recommended protocol. Launches a local MCP server subprocess via `command` and `args`, communicating through the OS's standard I/O pipes.
+
+    **Advantages:**
+    - Zero network overhead (data passes between processes via memory buffers)
+    - Natural security isolation (child processes inherit the parent's permission boundaries)
+    - Simple lifecycle management (child processes auto-terminate when the parent exits)
+
+    ```json
+    {
+      "mcpServers": {
+        "filesystem": {
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"],
+          "env": { "NODE_OPTIONS": "--max-old-space-size=4096" }
+        }
+      }
+    }
+    ```
+
+    **Best for:** Local dev tools, filesystem operations, CLI tool wrappers, Git clients.
+
+    <Warning>
+    Do not perform long-running initialization in stdio servers (e.g., establishing a database connection pool). Claude Code connects to all configured MCP servers in parallel at startup — slow initialization blocks the entire startup process. Use lazy initialization: establish connections only on the first tool invocation.
+    </Warning>
+  </Tab>
+  <Tab title="SSE / HTTP">
+    ### SSE — Remote HTTP services
+
+    Server-Sent Events: clients send requests via HTTP POST, servers stream responses and notifications via SSE. Enables MCP servers deployed anywhere in the cloud to be accessed by simply knowing their URL.
+
+    ```json
+    {
+      "mcpServers": {
+        "remote-service": {
+          "type": "sse",
+          "url": "https://mcp.company.com/api",
+          "headers": { "Authorization": "Bearer token" }
+        }
+      }
+    }
+    ```
+
+    ### HTTP Streamable — New MCP spec
+
+    A newer protocol in the MCP specification providing more flexible streaming response capabilities than SSE. Supports incrementally returning response content over a single HTTP connection — suitable for tools returning large amounts of data or running for extended periods.
+
+    **Best for:** Cloud-deployed MCP servers, internal company services, scenarios where the MCP server cannot run locally.
+  </Tab>
+  <Tab title="WebSocket">
+    ### WebSocket — Full-duplex bidirectional
+
+    Provides full-duplex communication: unlike SSE's unidirectional push, WebSocket allows the server to proactively send messages to the client and allows the client to send requests without establishing new HTTP connections each time.
+
+    **Best for:** Scenarios requiring real-time bidirectional data exchange.
+
+    ### ws-ide — WebSocket with IDE metadata
+
+    A specialized variant for IDE integration, adding IDE identification information (IDE name, OS details) on top of standard WebSocket. This "protocol variant" design avoids embedding platform-specific logic into the generic protocol.
+
+    **Best for:** IDE extensions requiring low-latency bidirectional communication.
+  </Tab>
+  <Tab title="sse-ide / sdk / proxy">
+    ### sse-ide — SSE with IDE metadata
+
+    SSE variant for IDE integration, adding `ideName` and other IDE identification metadata. Paired with Claude Code's IDE tool allowlist to ensure only the two approved IDE tools are registered.
+
+    ### sdk — In-process function calls
+
+    The most special type: no subprocess, no network connection. SDK-type servers are embedded directly into the Claude Code process through function calls, with near-zero latency.
+
+    Primarily for SDK integration scenarios, allowing third-party applications embedding Claude Code to register MCP tools directly without additional inter-process communication.
+
+    SDK servers are exempt from enterprise security policy checks — they run in the same process as Claude Code, with security boundaries guaranteed by the host application.
+
+    ### claudeai-proxy — Claude.ai platform
+
+    Proxy type for the Claude.ai platform's connector system.
+  </Tab>
+</Tabs>
+
+**Protocol selection rule:** Prefer `stdio`. Only consider SSE/HTTP/WebSocket when the MCP server must run on a remote machine. Use `sdk` only for programmatic embedding scenarios.
+
+---
+
+## Five-state connection lifecycle
+
+MCP server connections have five states forming a carefully designed finite state machine:
+
+<CardGroup cols={2}>
+  <Card title="Connected" icon="circle-check">
+    Server connected, tools available. The `ConnectedMCPServer` object contains the complete MCP Client instance, server capability declarations, configuration, and a cleanup function for graceful disconnection.
+  </Card>
+  <Card title="Failed" icon="circle-x">
+    Connection attempt failed. The system records the failure reason and decides whether to enter the retry flow. Authentication failures require user intervention and should not be retried automatically (which could lock accounts).
+  </Card>
+  <Card title="NeedsAuth" icon="key">
+    The server requires authentication but no valid credentials were provided. The system hands control to the user rather than retrying blindly.
+  </Card>
+  <Card title="Pending" icon="clock">
+    Awaiting reconnection with exponential backoff retry. `PendingMCPServer` records the number of reconnection attempts and maximum retry count. Prevents connection storms when the server is persistently unavailable.
+  </Card>
+</CardGroup>
+
+The fifth state — **Disabled** — indicates the server was actively disabled by the user or by policy. It will not auto-reconnect; only explicit re-enablement triggers a new connection attempt.
+
+### Exponential backoff retry
+
+When a connection fails and is retryable, the system applies exponential backoff:
+
+```
+Retry #1: wait ~1 second
+Retry #2: wait ~2 seconds
+Retry #3: wait ~4 seconds
+...up to maximum retry count
+```
+
+This balances responsiveness (don't wait too long if the server recovers quickly) against avoiding connection storms (don't hammer an unavailable server with rapid retries).
+
+<Note>
+MCP tools only appear in the tool list when the server is in the **Connected** state. When a server transitions from Connected to any other state, all its tools are immediately removed from the available tool list. Tool availability is dynamic, not static.
+</Note>
+
+---
+
+## MCP tool integration pipeline
+
+External MCP tools are incorporated into Claude Code's internal tool system through a three-stage pipeline:
+
+<Steps>
+  <Step title="Discovery">
+    After a server enters the Connected state, Claude Code sends a `tools/list` request to retrieve metadata for all tools: names, descriptions, input parameter schemas, and behavioral annotations (hints). This is like receiving a menu — you don't need to visit the kitchen to know what dishes are available.
+  </Step>
+  <Step title="Mapping">
+    Each MCP tool is mapped to a Claude Code internal `Tool` object through three operations:
+
+    1. **Unicode sanitization** — removes control characters and illegal characters from tool names
+    2. **Prefix decision** — determines whether to add the server name prefix (see below)
+    3. **Tool object construction** — translates MCP semantics into Claude Code tool system semantics, including behavioral annotation bridging
+
+    The three "Hint" mappings deserve attention: MCP's `readOnlyHint`, `destructiveHint`, and `openWorldHint` map to Claude Code's `isConcurrencySafe()`, `isDestructive()`, and `isOpenWorld()`. MCP annotations are "suggestive"; Claude Code's methods are "decisive." Even if annotations are inaccurate, the permission pipeline performs a secondary runtime check.
+  </Step>
+  <Step title="Registration">
+    Tools are registered into the tool system. Tools marked with `_meta.anthropic/alwaysLoad: true` are injected directly into the system prompt at startup. All other tools use lazy loading — descriptions are not injected until the model first needs to use the tool, saving significant token usage.
+  </Step>
+</Steps>
+
+Each mapped `Tool` object carries these properties:
+
+| Property | Source | Purpose |
+|---|---|---|
+| `isMcp: true` | Fixed flag | Distinguishes from built-in tools |
+| `mcpInfo` | Server config | Contains `serverName` and `toolName` for permission checks and UI display |
+| `isConcurrencySafe()` | MCP `readOnlyHint` | Affects concurrency scheduling strategy |
+| `isDestructive()` | MCP `destructiveHint` | Affects permission prompt level |
+| `isOpenWorld()` | MCP `openWorldHint` | Affects permission scope checks |
+| `alwaysLoad` | `_meta.anthropic/alwaysLoad` | When true, injects into system prompt at startup |
+
+---
+
+## Three-part tool naming convention
+
+MCP tools use the unified naming convention `mcp__{server}__{tool}`. This seemingly simple rule has several important design consequences.
+
+**Why prefixes?** Without namespace isolation, two servers providing a tool named `create_issue` (one GitHub, one GitLab) would create a name conflict. The three-part naming uses the server name as a namespace, ensuring global uniqueness even when different servers provide identically named tools.
+
+**Naming examples:**
+
+```
+mcp__github__create_issue   → server="github",    tool="create_issue"  ✓ Clear
+mcp__my_server__read_file   → server="my_server", tool="read_file"     ✓ Clear
+mcp__my__special__tool      → server="my",        tool="special__tool" ⚠ Ambiguous
+```
+
+The parsing function splits on the first double underscore after `mcp__`. If the server name contains double underscores, parsing may be inaccurate — though this rarely occurs in practice.
+
+<Tip>
+When naming MCP servers, avoid double underscores. Use single underscores (`my_server`) or hyphens (`my-server`) as separators.
+</Tip>
+
+**SDK prefix skip:** When `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` is set and the server type is `sdk`, tools are registered with their original names. This allows MCP tools to override built-in tools by name — an advanced embedding mechanism allowing a custom `Read` tool to replace Claude Code's built-in Read behavior.
+
+**Permission checks always use fully qualified names:** The `getToolNameForPermissionCheck` function ensures permission rules match on `mcp__server__tool` format. This prevents a user's permission grant for the built-in `Write` tool from being exploited by an MCP tool also named `Write`.
+
+---
+
+## Permission model
+
+MCP tool permissions follow a four-layer defense-in-depth model:
+
+<Tabs>
+  <Tab title="Layer 1: Enterprise policy">
+    Enterprise administrators control MCP server access through `allowedMcpServers` and `deniedMcpServers` policies.
+
+    **Denylist** has absolute priority — servers on the denylist are never connected, regardless of which scope they appear in. Three matching methods:
+    - By server name (registered name in configuration)
+    - By command array (for stdio: `command + args`; prevents bypass via name changes)
+    - By URL pattern (wildcard support: `"https://mcp.company.com/*"`)
+
+    **Allowlist** — if defined, only listed servers are permitted. Stricter than a denylist: deny everything by default, allow only what is explicitly approved.
+
+    ```json
+    {
+      "allowedMcpServers": [
+        { "serverName": "approved-server" },
+        { "serverUrl": "https://mcp.company.com/*" }
+      ],
+      "deniedMcpServers": [
+        { "serverName": "dangerous-server" }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Layer 2: IDE tool allowlist">
+    For IDE-integrated MCP servers (`sse-ide`, `ws-ide`), only two tools may be loaded:
+
+    | Tool | Function | Security rationale |
+    |---|---|---|
+    | `mcp__ide__executeCode` | Execute code in IDE environment | Restricted to IDE sandbox context |
+    | `mcp__ide__getDiagnostics` | Get IDE diagnostic information | Read-only; does not modify state |
+
+    All other tools exposed by IDE MCP servers are filtered out during discovery — they never appear in Claude Code's tool registry. The model cannot even attempt to invoke them.
+  </Tab>
+  <Tab title="Layer 3: User permissions">
+    Users configure per-tool rules in `.claude/settings.local.json`:
+
+    ```json
+    {
+      "permissions": {
+        "allow": [
+          "mcp__my_server__read_file",
+          "mcp__github__*"
+        ],
+        "deny": [
+          "mcp__github__delete_repo"
+        ]
+      }
+    }
+    ```
+
+    Wildcard rules:
+    - `mcp__github__create_issue` — exact match
+    - `mcp__github__*` — all tools from the GitHub server
+    - `mcp__*` — all MCP tools (use with extreme caution)
+
+    <Warning>
+    Do not use `"mcp__*": "allow"` in global configuration. Any tools provided by newly connected MCP servers — including servers you may not be familiar with — will be automatically allowed to execute without confirmation.
+    </Warning>
+  </Tab>
+  <Tab title="Layer 4: Runtime confirmation">
+    Tools not covered by any rule require user confirmation on each invocation. This "confirm by default" design increases interaction cost but is correct from a security standpoint: you cannot predict what a third-party MCP tool will do.
+  </Tab>
+</Tabs>
+
+---
+
+## Configuration scopes
+
+MCP server configuration has seven scopes corresponding to different management levels and trust boundaries:
+
+| Scope | Config source | Management level | Typical use |
+|---|---|---|---|
+| `local` | `.claude/settings.local.json` | Project-personal | Developer's personal tools; not committed to VCS |
+| `project` | `.claude/settings.json` | Project-shared | Team-shared tool config; committed to VCS |
+| `user` | `~/.claude/settings.json` | User-global | Cross-project general tools (e.g., GitHub MCP) |
+| `dynamic` | Added at runtime | Session-level | Temporarily added tools; disappear after session ends |
+| `enterprise` | Enterprise management config | Organization-level | Approved tool allowlists and denylists |
+| `claudeai` | Claude.ai platform connectors | Platform-level | Claude.ai web interface tool connections |
+| `managed` | Managed policy config | Admin-level | IT administrator-enforced policies |
+
+**Priority rules:**
+- **Hard constraints** (`enterprise`, `managed`) cannot be overridden by lower-level scopes — enterprise administrator decisions are final.
+- **Soft config** follows proximity: `local` overrides `project`, which overrides `user`.
+- **Temporary** (`dynamic`, `claudeai`) are session-scoped.
+
+### Plugin deduplication
+
+When a plugin-provided MCP server points to the same underlying process or URL as a manually configured server, the system automatically deduplicates using signature comparison:
+
+| Server type | Signature | Example |
+|---|---|---|
+| `stdio` | `stdio:${JSON.stringify([command, ...args])}` | `stdio:["npx","-y","@mcp/server-filesystem","/tmp"]` |
+| Remote | `url:${originalUrl}` | `url:https://mcp.example.com/api` |
+| `sdk` | `null` (no deduplication) | N/A |
+
+Deduplication priority: **manual config** overrides **plugin config** overrides **Claude.ai connector**. The user's explicit configuration always wins — preserving custom parameters like personal API tokens.
+
+---
+
+## The Bridge bidirectional communication system
+
+The Bridge system is the core layer for bidirectional communication between Claude Code and the external world. It handles IDE integration (VS Code, JetBrains), claude.ai platform remote control, and multi-session management.
+
+### Bidirectional message flows
+
+**Outbound (CLI → External):** Conversation messages, tool invocation results, state change notifications, errors. Simple unidirectional push.
+
+**Inbound (External → CLI):** User messages, permission responses, control requests. Much more complex — requires triple filtering:
+
+<Steps>
+  <Step title="Permission response filter">
+    User clicks "Allow" or "Deny" in the IDE. Routes directly to the permission pipeline without additional checks.
+  </Step>
+  <Step title="Control request filter">
+    Requests like `initialize`, `set_model`, `interrupt`. Blocked in outbound-only mode (except `initialize`, which is read-only). Executed in normal mode.
+  </Step>
+  <Step title="User message filter">
+    Applied in sequence: echo filter (discard messages already sent as outbound), then redelivery filter (discard messages already processed via `BoundedUUIDSet`), then deliver to the REPL.
+  </Step>
+</Steps>
+
+**`BoundedUUIDSet`** is a FIFO bounded set implemented via ring buffer, maintaining a fixed-capacity set of recently processed message UUIDs. When a new message arrives, the system checks whether its UUID is in the set. The ring buffer keeps only the N most recent UUIDs — large enough to cover network retransmission windows (seconds to minutes), small enough to avoid memory pressure.
+
+### Control protocol
+
+The Bridge implements a lightweight RPC protocol supporting five control subtypes:
+
+| Subtype | Purpose | Notes |
+|---|---|---|
+| `initialize` | Handshake; report capabilities | Read-only; allowed even in outbound-only mode |
+| `set_model` | Remotely switch model | Returns success/failure |
+| `set_max_thinking_tokens` | Adjust thinking token budget | Returns success/failure |
+| `set_permission_mode` | Switch permission mode | Returns policy verdict |
+| `interrupt` | Interrupt current execution | Fire-and-forget; no response waited |
+
+`interrupt` is the only fire-and-forget command — it prioritizes response speed over reliability. Waiting for a response would delay the interrupt's execution.
+
+### Transport layer abstraction: v1 vs. v2
+
+The Bridge wraps two transport implementations behind a unified `ReplBridgeTransport` interface:
+
+<Tabs>
+  <Tab title="v1 (legacy)">
+    **v1 adapter** uses WebSocket for reading + HTTP POST for writing to the Session-Ingress service. A hybrid approach that leverages each protocol's strengths: WebSocket for server push (low latency), HTTP POST for client sending (simple, reliable). Still operational but no longer recommended for new development.
+  </Tab>
+  <Tab title="v2 (recommended)">
+    **v2 adapter** uses SSETransport for reading + CCRClient for writing to CCR v2 endpoints. Three key improvements over v1:
+
+    **1. SSE sequence number continuation**
+
+    In traditional SSE, reconnection causes the server to replay the entire event history — a "message storm" for long-running sessions. v2 carries the previous stream's high-water sequence number mark during transport switching. When the client reconnects with `lastSeq = N`, the server starts from `N+1`, delivering only incremental messages.
+
+    ```
+    t0: Messages #1–5 delivered normally
+    t1: SSE connection drops (network jitter)
+    t2: Client reconnects with lastSeq = 5
+    t3: Server resumes from message #6 — no replay, no message storm
+    ```
+
+    **2. Epoch management and heartbeats**
+
+    The Epoch is a monotonically increasing logical clock that increments with each transport switch. It distinguishes "delayed messages from old connections" from "new messages from new connections," preventing stale message processing. Periodic heartbeats detect connection liveness and trigger reconnection when they time out.
+
+    **3. Per-instance closure authentication**
+
+    v2 provides per-instance authentication through closures rather than global environment variables. In multi-session scenarios, v1's global token can cause inconsistency when one instance refreshes the token while another reads the old value. v2 closures give each transport instance its own authentication context, with no mutual interference.
+  </Tab>
+</Tabs>
+
+### IDE integration flow
+
+IDE extensions communicate with Claude Code through `sse-ide` and `ws-ide` type MCP servers:
+
+<Steps>
+  <Step title="IDE extension starts local MCP server">
+    When the user opens the Claude Code extension in VS Code or JetBrains, the extension launches a local MCP server process listening on a randomly assigned local port.
+  </Step>
+  <Step title="URL passing">
+    The extension passes the server URL to Claude Code via environment variable (e.g., `CLAUDE_CODE_IDE_MCP_URL`) or CLI arguments.
+  </Step>
+  <Step title="Connection establishment">
+    Claude Code connects using the `sse-ide` or `ws-ide` protocol, establishing itself as a client of the IDE's MCP server.
+  </Step>
+  <Step title="Tool discovery with allowlist filtering">
+    Claude Code retrieves the tool list via `tools/list`. The IDE tool allowlist filter runs immediately — only `executeCode` and `getDiagnostics` are registered. All other tools are discarded and never appear in the registry.
+  </Step>
+  <Step title="Runtime tool usage">
+    The Claude model invokes `mcp__ide__getDiagnostics` to see real-time compilation errors without copy-paste, and `mcp__ide__executeCode` to apply fixes in the IDE's full context (TypeScript configuration, Node.js version, environment variables).
+  </Step>
+</Steps>
+
+### Bridge permission gating
+
+Bridge (remote control) functionality requires four conditions to all be satisfied:
+
+| Layer | Condition | Blocked when |
+|---|---|---|
+| 1. Subscription type | claude.ai subscriber | Using Bedrock, Vertex, or Foundry API |
+| 2. Profile completeness | Full profile scope | Restricted token without profile information |
+| 3. Organization info | Organization UUID present | Account not associated with an organization |
+| 4. Feature flag | `tengu_ccr_bridge` enabled | Not yet in the feature rollout |
+
+All four layers must pass for Bridge functionality to become available. This "checkpoint upon checkpoint" design follows defense in depth — even if one layer's check is bypassed, other layers still provide protection.
+
+**OAuth token auto-refresh:** When an API request receives a 401 response, the Bridge client uses the refresh token to obtain a new bearer token and retries the original request automatically. Token expiration is transparent to users and does not interrupt ongoing Bridge sessions.
+
+---
+
+## Configuring MCP servers
+
+### Basic stdio server
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Remote SSE server with authentication
+
+```json
+{
+  "mcpServers": {
+    "internal-database": {
+      "type": "sse",
+      "url": "https://internal-mcp.company.com/database",
+      "headers": { "Authorization": "Bearer internal-token" }
+    }
+  }
+}
+```
+
+### Per-tool permission configuration
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__filesystem__read_file",
+      "mcp__github__*"
+    ],
+    "deny": [
+      "mcp__filesystem__write_file"
+    ]
+  }
+}
+```
+
+### Enterprise security policy
+
+```json
+{
+  "allowedMcpServers": [
+    { "serverName": "approved-server" },
+    { "serverCommand": ["npx", "-y", "@modelcontextprotocol/server-filesystem"] },
+    { "serverUrl": "https://mcp.company.com/*" }
+  ],
+  "deniedMcpServers": [
+    { "serverName": "dangerous-server" }
+  ]
+}
+```
+
+---
+
+## Error handling and reconnection strategies
+
+| Failure scenario | System response | User action needed |
+|---|---|---|
+| Network jitter (transient) | Exponential backoff retry → Connected | None |
+| Server unreachable (persistent) | Pending → max retries → Failed | Fix server, then use toggle to reconnect |
+| Authentication expired | Failed with auth reason → NeedsAuth | Provide valid credentials |
+| User disables server | Connected → Disabled | Re-enable via toggle |
+| Policy blocks server | Blocked before connection attempt | Contact administrator |
+
+<Tip>
+In enterprise environments using Bridge functionality, ensure: team members sign in with claude.ai subscription accounts (not API Keys), the organization UUID is correctly configured, and the network firewall permits SSE/CCR communication with the claude.ai backend.
+</Tip>

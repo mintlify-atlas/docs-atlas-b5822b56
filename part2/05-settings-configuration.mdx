@@ -1,0 +1,342 @@
+---
+title: "Settings & Configuration — Agent's DNA"
+description: "How Claude Code's six-layer configuration priority chain shapes agent behavior, manages security boundaries, and controls feature availability from compile time to runtime."
+---
+
+Configuration is the DNA of a Claude Code agent. Just as an organism's genes are determined at the moment of fertilization and expressed layer by layer during development, Claude Code's configuration is loaded at startup and takes effect layer by layer at runtime. Understanding this system is the first step toward mastering Claude Code's behavior customization capabilities.
+
+## The six-layer priority chain
+
+Claude Code does not read a single configuration file. Instead, it merges six distinct configuration sources in a defined order — later sources override earlier ones.
+
+The complete priority chain from lowest to highest:
+
+```
+pluginSettings → userSettings → projectSettings → localSettings → flagSettings → policySettings
+```
+
+Think of these as geological strata: each layer can override configuration from lower layers, but will not delete them — they are simply "shadowed." This design ensures that each layer can be independently understood and maintained.
+
+<CardGroup cols={2}>
+  <Card title="pluginSettings" icon="puzzle-piece">
+    Plugin-supplied base defaults. Lowest priority — any other source overrides these values.
+  </Card>
+  <Card title="userSettings" icon="user">
+    Personal global settings at `~/.claude/settings.json`. Applies across all projects for the current user.
+  </Card>
+  <Card title="projectSettings" icon="folder">
+    Team-shared settings at `.claude/settings.json`. Committed to Git and shared with all collaborators.
+  </Card>
+  <Card title="localSettings" icon="laptop">
+    Personal project overrides at `.claude/settings.local.json`. Added to `.gitignore` — never shared.
+  </Card>
+  <Card title="flagSettings" icon="flag">
+    One-time overrides via the CLI `--settings` parameter. Temporary and traceable.
+  </Card>
+  <Card title="policySettings" icon="shield">
+    Enterprise-managed policy at the highest priority. Delivered via MDM, remote API, or a managed JSON file.
+  </Card>
+</CardGroup>
+
+### Configuration file paths
+
+| Source | File path | In Git? |
+|---|---|---|
+| `userSettings` | `~/.claude/settings.json` | N/A (user directory) |
+| `projectSettings` | `<project>/.claude/settings.json` | Yes |
+| `localSettings` | `<project>/.claude/settings.local.json` | No |
+| `flagSettings` | Path specified via `--settings` CLI flag | N/A |
+| `policySettings` | Platform-specific `managed-settings.json` | N/A |
+
+### How policySettings is resolved
+
+Unlike all other sources, `policySettings` uses a **first non-empty source wins** strategy rather than deep merge. It searches four locations in order and uses the first one that has content:
+
+<Steps>
+  <Step title="Remote API settings">
+    Retrieved from `getRemoteManagedSettingsSyncFromCache`. Highest authority.
+  </Step>
+  <Step title="MDM settings">
+    macOS plist or Windows HKLM registry. Used in managed device deployments.
+  </Step>
+  <Step title="managed-settings.json">
+    A local `managed-settings.json` file, plus any files in `managed-settings.d/`.
+  </Step>
+  <Step title="HKCU registry">
+    Windows user-level registry. Lowest of the four policy sources.
+  </Step>
+</Steps>
+
+<Note>
+Enterprise policies are typically a complete, audited configuration scheme. The "first source wins" strategy ensures policies from different sources cannot "leak" into each other. A policy delivered via remote API already contains complete security rules and should not be diluted by partial configurations from a local file.
+</Note>
+
+## Merge rules
+
+The `loadSettingsFromDisk()` function applies a custom merge strategy when combining sources. The rules differ by data type:
+
+| Type | Rule | Example |
+|---|---|---|
+| **Array** | Concatenate and deduplicate | `permissions.allow` accumulates rules from all sources |
+| **Object** | Deep merge — nested properties overridden layer by layer | `hooks.PreToolUse` nested properties merged individually |
+| **Scalar** | Higher-priority source directly overrides | `model: "claude-opus-4"` in `policySettings` overrides all others |
+
+**Why do arrays concatenate instead of replace?** In the permission system, each rule is a defense line. If a higher-priority source's array replaced a lower-priority one, the higher source would have to enumerate all needed rules completely — any omission becomes a security gap. The concatenation strategy lets each layer add only the rules it wants to contribute, and the system automatically merges all layers' security policies.
+
+<Warning>
+You cannot revoke lower-layer permissions by setting an empty array in a higher layer. After concatenation, the lower-layer rules still exist. To revoke permissions, use the `permissions.deny` field to explicitly deny them.
+</Warning>
+
+### Merge in practice
+
+Consider a frontend team's configuration:
+
+<CodeGroup>
+
+```json ~/.claude/settings.json (userSettings)
+{
+  "model": "claude-sonnet-4",
+  "permissions": {
+    "allow": ["Bash(npm *)", "Bash(node *)"]
+  },
+  "verbose": true
+}
+```
+
+```json .claude/settings.json (projectSettings)
+{
+  "permissions": {
+    "allow": ["Bash(npm run lint)", "Bash(npm test)", "Read(*)"]
+  },
+  "hooks": {
+    "PreToolUse": [{ "matcher": "Bash(*)", "hooks": [{ "type": "command", "command": "audit-log.sh" }] }]
+  }
+}
+```
+
+```json .claude/settings.local.json (localSettings)
+{
+  "model": "claude-opus-4",
+  "permissions": {
+    "allow": ["Bash(git *)"]
+  }
+}
+```
+
+</CodeGroup>
+
+The merged result:
+
+```json
+{
+  "model": "claude-opus-4",
+  "verbose": true,
+  "permissions": {
+    "allow": [
+      "Bash(npm *)",
+      "Bash(node *)",
+      "Bash(npm run lint)",
+      "Bash(npm test)",
+      "Read(*)",
+      "Bash(git *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [{ "matcher": "Bash(*)", "hooks": [{ "type": "command", "command": "audit-log.sh" }] }]
+  }
+}
+```
+
+`model` is `"claude-opus-4"` because `localSettings` overrides `userSettings`. `permissions.allow` is the full concatenated and deduplicated union of all three sources.
+
+## Security boundaries
+
+The core security challenge: `projectSettings` is committed to Git repositories, which means users who clone a malicious repository may unknowingly load the attacker's configuration. Claude Code's defense strategy is to **systematically exclude `projectSettings` from all security-sensitive checks**.
+
+This is like a building's access control system: project keycards can open meeting rooms (projectSettings), but can never open server rooms (security-sensitive operations).
+
+### The threat model
+
+A concrete supply chain attack scenario: an attacker creates a seemingly normal open-source project with a `PreToolUse` hook in `.claude/settings.json` that exfiltrates sensitive information (API keys, environment variables) on every tool call. When a developer clones the project and starts Claude Code, the malicious hook executes without their knowledge.
+
+`projectSettings` is the highest-risk configuration source because it simultaneously has three dangerous properties other sources lack:
+
+1. **Untrusted source** — comes from cloned third-party repositories, not written by the user
+2. **Automatic loading** — takes effect upon entering the project directory, without user confirmation
+3. **Executable code** — hooks configuration can execute arbitrary shell commands
+
+### Trust levels
+
+The system assigns trust levels that determine which sources are consulted for security-sensitive operations:
+
+| Trust level | Sources | Notes |
+|---|---|---|
+| Highest | `policySettings` | Enterprise-configured, through audit process |
+| High | `flagSettings`, `localSettings`, `userSettings` | User-controlled files |
+| Low | `projectSettings` | May come from third-party repositories |
+| Lowest | `pluginSettings` | Requires additional verification |
+
+In security-sensitive checks — such as `skipDangerousModePermissionPrompt`, `hasAutoModeOptIn()`, and `getAutoModeConfig()` — the system only reads from sources with high or highest trust. The source comments consistently state: **`projectSettings` is intentionally excluded — a malicious project could otherwise auto-bypass the dialog (RCE risk)**.
+
+### Enterprise security controls
+
+<AccordionGroup>
+  <Accordion title="shouldAllowManagedHooksOnly">
+    When `allowManagedHooksOnly` is enabled in policy settings, hooks execution uses only hooks from `policySettings`. All hooks from user, project, and local sources are skipped entirely.
+
+    **Use case:** A financial institution requires all code changes to be logged through an internal audit system. An administrator sets `allowManagedHooksOnly: true` and configures an audit logging hook in `policySettings`. Regardless of what hooks developers have locally, only the administrator's audit hook runs.
+  </Accordion>
+  <Accordion title="strictPluginOnlyCustomization">
+    Locks specific customization surfaces so only plugin, policySettings, or built-in sources are trusted. Lockable surfaces are: `skills`, `agents`, `hooks`, and `mcp`.
+
+    This allows selective locking — enterprise administrators can prevent developers from connecting to unapproved MCP servers (lock `mcp`) while still allowing custom skills (don't lock `skills`).
+
+    **Example:** Set `strictPluginOnlyCustomization: ["mcp"]` to prevent self-installed MCP servers while allowing all other customization.
+  </Accordion>
+</AccordionGroup>
+
+## Feature flag system
+
+Claude Code's feature flag system has two distinct layers: a **compile-time** `feature()` function and a **runtime** GrowthBook experimentation framework.
+
+### Compile-time dead code elimination
+
+The `feature()` function is processed by the bundler. When `feature('FEATURE_NAME')` returns `false`, the bundler completely removes the corresponding code branch from the build artifact — unenabled features simply do not exist in the output.
+
+```typescript
+// Approach A (runtime check) — unenabled code still ships
+if (featureFlags.isEnabled('KAIROS')) {
+  // This code is in the bundle even when disabled
+}
+
+// Approach B (compile-time elimination) — unenabled code is removed entirely
+if (feature('KAIROS')) {
+  // This code is absent from the bundle when disabled
+}
+```
+
+The compile-time approach solves three problems at once: unenabled features don't add to package size, there's no runtime overhead on hot paths, and unenabled code can't introduce uncovered bugs or security vulnerabilities.
+
+Key feature flags and their architectural significance:
+
+| Flag | Scope | Description |
+|---|---|---|
+| `KAIROS` | Core architecture | Persistent session (assistant mode) |
+| `EXTRACT_MEMORIES` | Memory system | Background memory extraction |
+| `TRANSCRIPT_CLASSIFIER` | Permission system | Automatic mode classifier |
+| `TEAMMEM` | Collaboration | Team memory sharing |
+| `DAEMON` | Architecture | Background daemon process |
+| `BRIDGE_MODE` | Architecture | Cross-process communication bridge |
+| `TEMPLATES` | Task system | Reusable workflow templates |
+
+<Tip>
+From these flags you can read the evolutionary direction of Claude Code: `KAIROS` and `DAEMON` point toward evolution from "on-demand invocation" to "continuous operation"; `TEAMMEM` and `TEMPLATES` point toward evolution from "personal tool" to "team infrastructure."
+</Tip>
+
+### Runtime GrowthBook experiments
+
+For features that need dynamic control without redeployment, Claude Code uses the GrowthBook A/B testing framework. The entry function `getFeatureValue_CACHED_MAY_BE_STALE` accepts a feature name and default value and reads synchronously from cache.
+
+<Note>
+The "CACHED_MAY_BE_STALE" in the function name is intentional — it encodes a non-obvious behavioral constraint directly into the name so callers are reminded of this limitation every time they use it. The value comes from cache and may be stale in cross-process scenarios. This is preferable to blocking the startup critical path waiting for a remote configuration fetch.
+</Note>
+
+Features controlled by GrowthBook use randomly named experiment identifiers (e.g., `tengu_passport_quail`, `tengu_coral_fern`). Random names avoid semantic bias and do not conflict with the compile-time `feature()` function names.
+
+**Decision tree for choosing the right flag type:**
+
+<Steps>
+  <Step title="Can the feature be determined at release time?">
+    If yes, use the compile-time `feature()` flag. Zero runtime overhead, smaller bundle size, but requires redeployment to change.
+  </Step>
+  <Step title="Does it need dynamic runtime control?">
+    If yes, use a GrowthBook runtime flag. Adjustable without redeployment, but has runtime overhead and depends on cache freshness.
+  </Step>
+  <Step title="Does it need A/B testing?">
+    Use GrowthBook with random experiment group names. This avoids semantic bias and keeps compile-time and runtime flags cleanly separated.
+  </Step>
+  <Step title="None of the above?">
+    Hardcode it directly — no flag needed.
+  </Step>
+</Steps>
+
+## State management
+
+Configuration is the DNA that determines the agent's potential; state is the nervous system that coordinates runtime behavior. Claude Code uses a minimalist immutable state container inspired by Zustand.
+
+### The Store
+
+The state management module implements a generic `Store` in 34 lines, providing three core methods:
+
+- `getState()` — retrieves the current state snapshot
+- `setState(updater)` — updates state by passing an updater function `(prev: T) => T`
+- `subscribe(listener)` — subscribes to state changes, returns an unsubscribe function
+
+**Immutable updates:** `setState` requires callers to return an entirely new state object. It compares old and new references using `Object.is` — only when the reference changes are listeners notified. This delegates the judgment of "whether a change occurred" to the caller, expressed through whether they return a new reference.
+
+### AppState
+
+The global `AppState` type is marked as `DeepImmutable`, preventing any direct state modification at compile time. It contains over 50 fields organized in architectural layers:
+
+| Layer | Fields | Change frequency |
+|---|---|---|
+| Settings | `settings`, `verbose`, `mainLoopModel` | Determined at startup, rarely changes |
+| Permission | `toolPermissionContext` | Changes dynamically with tool calls |
+| Integration | `mcp.*`, `plugins.*` | Managed by subsystem initialization |
+| Communication | `replBridge*`, `teamContext` | Cross-process / cross-agent state |
+| Execution | `speculation`, `agentDefinitions` | Dynamically created and destroyed |
+
+### React bindings
+
+`AppStateProvider` wraps the Store as a React Context with two access hooks:
+
+- **`useAppState(selector)`** — uses `useSyncExternalStore` to subscribe to a state slice. Only triggers re-render when the selector's return value changes.
+- **`useSetAppState()`** — retrieves only the `setState` function, never re-renders due to state changes.
+
+```typescript
+// Anti-pattern: subscribes to entire state — any field change triggers re-render
+const state = useAppState(s => s);
+
+// Recommended: precisely subscribe to individual fields
+const model = useAppState(s => s.mainLoopModel);
+const verbose = useAppState(s => s.verbose);
+
+// Recommended for write-only components: never re-renders
+const setState = useSetAppState();
+```
+
+<Tip>
+Follow the principle of minimum subscription — components should only subscribe to the portion of state they actually use. Avoid creating new objects in selectors: `useAppState(s => ({ a: s.a, b: s.b }))` returns a new reference on every call, causing infinite re-renders. Subscribe to fields separately instead.
+</Tip>
+
+## Real-world configuration strategies
+
+<Tabs>
+  <Tab title="Personal-team separation">
+    The most common pattern. Developers place personal preferences in `userSettings` and `localSettings`, and team-shared rules in `projectSettings`:
+
+    ```
+    ~/.claude/settings.json       → Personal model preferences, personal permission rules
+    .claude/settings.json         → Team lint rules, permission baselines, shared hooks
+    .claude/settings.local.json   → Personal overrides (debug mode, special permissions)
+    ```
+  </Tab>
+  <Tab title="CI/CD configuration">
+    In automated pipelines, use `flagSettings` to inject one-time configuration via CLI parameters, avoiding modifications to any persistent configuration files:
+
+    ```bash
+    claude --settings /path/to/ci-settings.json
+    ```
+
+    This ensures CI environment configuration is temporary and traceable, without polluting developers' local environments.
+  </Tab>
+  <Tab title="Enterprise unified control">
+    Large organizations deliver `policySettings` through MDM or remote APIs, locking security-related items while allowing teams to customize non-security behaviors:
+
+    ```
+    policySettings   → Locked: model, permissions.deny, allowManagedHooksOnly
+    projectSettings  → Customized: hooks, MCP server configuration
+    userSettings     → Personalized: verbose, UI preferences
+    ```
+  </Tab>
+</Tabs>

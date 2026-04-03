@@ -1,0 +1,530 @@
+---
+title: "The Permission Pipeline"
+description: "How Claude Code's four-stage permission pipeline and five permission modes create defense-in-depth guardrails for agent actions."
+---
+
+When an agent executes tasks autonomously, it may invoke dozens of tools in a single session — writing files, running Bash commands, searching code. Every invocation carries hidden risk: an inappropriate `rm -rf`, an accidental `npm publish`, either could cause irreversible consequences.
+
+The Permission Pipeline is the safety guardrail Claude Code builds for the agent. It is not a simple allow/deny switch, but a carefully designed multi-stage checking mechanism that finds a precise balance between automation efficiency and security control.
+
+<Note>
+Think of the permission pipeline as a modern office building's access control system: the lobby requires only a card swipe, meeting rooms require a reservation, and the server room requires fingerprint verification plus dual-person authorization. Each layer is independent — even if one is bypassed, the next layer still blocks unauthorized access. This is **defense in depth** applied to software.
+</Note>
+
+---
+
+## The four-stage pipeline
+
+Claude Code's permission checking is a pipeline composed of four stages. Each stage has its own responsibility and short-circuit logic: once a stage makes a final decision, subsequent stages do not execute.
+
+<Steps>
+  <Step title="Stage 1 — validateInput: Zod schema validation">
+    The first checkpoint is not about permissions at all — it is about input data validity. The tool's input is parsed through a Zod schema with strict structural validation. If the input does not conform to the schema (for example, the Bash tool is missing the required `command` field), parsing throws an exception and the tool call is rejected outright.
+
+    This design separates two distinct failure modes:
+
+    | Failure mode | Meaning | Handling |
+    |---|---|---|
+    | Invalid data | A programming error — malformed parameters | Schema rejection |
+    | Insufficient permissions | A policy decision — the operation is not allowed | Permission pipeline |
+
+    When parsing fails, `toolPermissionResult` retains its default `passthrough` state, which is subsequently converted to `ask` behavior. This means that even when data validation fails, the system **gracefully degrades to requesting user confirmation** rather than crashing outright.
+
+    <Tip>
+    In security systems, error handling should be "safe" rather than "correct." Crashing exposes the problem, but during agent runtime it interrupts the entire session. Graceful degradation to user confirmation gives the user the opportunity to decide whether to continue, rather than having the system decide on their behalf.
+    </Tip>
+  </Step>
+
+  <Step title="Stage 2 — hasPermissionsToUseTool: rule matching">
+    Rule matching is the core of the permission pipeline. The `hasPermissionsToUseToolInner` function checks three rule types in strict priority order:
+
+    **Step 1a — Tool-level deny check (highest priority).** The `getDenyRuleForTool` function traverses deny rules from all sources for matching. The matching logic supports exact tool name matching and MCP server-level wildcards — for example, `mcp__server1__*` matches all tools under that server.
+
+    **Step 1b — Tool-level ask check.** When a tool is configured to "always ask," the system forces a confirmation prompt. One exception: when the Bash tool is in sandbox mode with the sandbox auto-approve option configured, sandboxed commands can skip the ask rule. The rationale: if you already trust the sandbox environment (commands within it cannot affect the outside system), the risk has been reduced to an acceptable level.
+
+    **Step 2b — Tool-level allow check.** If no deny or ask rules match, the system checks whether an allow rule exists to directly permit the operation.
+
+    Rules are evaluated across eight sources in priority order, from lowest to highest:
+
+    | Priority | Source | Scope |
+    |---|---|---|
+    | 1 (lowest) | `userSettings` | Global user configuration |
+    | 2 | `projectSettings` | Project-level `.claude/settings.json` |
+    | 3 | `localSettings` | Local `.claude/settings.local.json` (not committed) |
+    | 4 | `flagSettings` | Feature flags |
+    | 5 | `policySettings` | Policy settings |
+    | 6 | `cliArg` | Command-line arguments |
+    | 7 | `command` | Command-level rules |
+    | 8 (highest) | `session` | Session-level rules (most recent) |
+
+    <Warning>
+    **Deny always beats allow.** Regardless of source, a deny rule takes precedence over any allow rule. Even if you have allowed a tool in global user settings, a project-level deny rule makes the tool unavailable. This is a fundamental principle of security systems — explicit denial is always stronger than explicit permission.
+    </Warning>
+  </Step>
+
+  <Step title="Stage 3 — checkPermissions: context evaluation">
+    Each tool can implement its own `checkPermissions` method for fine-grained context evaluation. For example, the Bash tool parses subcommands, checks path safety, and matches prefix rules. This stage runs before the allow-rule check in Stage 2, but its results may be overridden by subsequent allow rules.
+
+    The `PermissionResult` returned by `checkPermissions` has four possible behaviors:
+
+    | Result | Meaning | Pipeline effect |
+    |---|---|---|
+    | `allow` | Permit directly, possibly carrying `updatedInput` | Short-circuits — no further stages |
+    | `deny` | Reject execution | Short-circuits — no further stages |
+    | `ask` | Requires user confirmation | Flows to Stage 4 |
+    | `passthrough` | No opinion — defer to subsequent stages | Converted to `ask` in later steps |
+
+    `passthrough` is a deliberate design choice. When a tool has no special permission logic it returns `passthrough`, allowing the pipeline to continue. In subsequent steps, `passthrough` is automatically converted to `ask`.
+
+    <Note>
+    Why is `passthrough` needed instead of returning `ask` directly? The difference is intent: `passthrough` means "I have no opinion, let subsequent stages decide," while `ask` means "I believe this operation requires user confirmation." If a subsequent allow rule matches, `passthrough` will be overridden to `allow` — but `ask` will not. This subtle distinction produces different behaviors in specific scenarios.
+    </Note>
+  </Step>
+
+  <Step title="Stage 4 — Interactive prompt: user confirmation">
+    When the pipeline reaches the `ask` state, the permission confirmation hook takes control. This React hook transforms the permission request into a user interaction interface.
+
+    Before the user responds, the system may also run an asynchronous classifier check (`pendingClassifierCheck`). This means the classifier may have automatically approved the operation while the user is still reading the prompt — implementing a **race** mechanism. Whoever makes a decision first, that decision takes effect.
+
+    The race is resolved atomically by the `ResolveOnce` pattern (see [ResolveOnce below](#resolveonce-atomic-race-resolution)):
+
+    ```typescript
+    // Conceptual structure of the race
+    const resolver = new ResolveOnce();
+
+    // Path A: classifier check (with 2-second timeout)
+    runClassifier(toolCall).then(result => {
+      if (result.confident) resolver.claim('classifier', result.decision);
+    });
+
+    // Path B: user interaction
+    showPromptToUser(toolCall).then(choice => {
+      resolver.claim('user', choice);
+    });
+
+    // First claim wins; subsequent claims are ignored
+    const { source, decision } = await resolver.resolved;
+    ```
+
+    Three decision sources can participate in the race:
+
+    | Source | Trust level | Description |
+    |---|---|---|
+    | `hook` | Highest | External hook scripts — run before the user sees the prompt; represents system administrator intent |
+    | `user` | Medium | Manual user selection in the terminal — the `permanent` flag controls whether the decision is persisted to configuration |
+    | `classifier` | Lowest | AI classifier automatic decision in `auto` mode — may be incorrect, which is why certain security check types are classifier-immune |
+
+    <Tip>
+    In enterprise environments, combine three strategies to reduce permission prompt frequency: (1) pre-configure allow rules in project configuration for common operations; (2) use `auto` mode to let the classifier handle routine requests; (3) configure hook scripts for custom auto-approval logic. These three strategies stack, covering scenarios from simple to complex.
+    </Tip>
+  </Step>
+</Steps>
+
+---
+
+## ResolveOnce: atomic race resolution
+
+Multiple asynchronous participants may simultaneously attempt to resolve the same permission request — the user clicks "allow" at the exact moment the classifier returns "pass." The `ResolveOnce` pattern resolves this race condition.
+
+```typescript
+class ResolveOnce<T> {
+  private claimed = false;
+  private _resolve?: (value: T) => void;
+  readonly resolved: Promise<T>;
+
+  constructor() {
+    this.resolved = new Promise(resolve => { this._resolve = resolve; });
+  }
+
+  // Atomic "first come, first served" operation
+  claim(value: T): boolean {
+    if (this.claimed) return false;   // already claimed — reject
+    this.claimed = true;               // atomic in JS single-threaded model
+    this._resolve!(value);
+    return true;
+  }
+
+  isResolved(): boolean {
+    return this.claimed;
+  }
+}
+```
+
+The `claim()` method provides a "first come, first served" atomic operation. In JavaScript's single-threaded model, `claim()` guarantees that even if two asynchronous callbacks are scheduled nearly simultaneously, only one can successfully claim — the other is rejected. This is a lightweight mutex implementation that avoids the overhead of locks common in distributed systems.
+
+Think of it as a non-transferable concert ticket: once redeemed by one person, no one else can use the same ticket. No locks, no waiting, no coordination — just a simple "redeemed" flag.
+
+---
+
+## The five permission modes
+
+Claude Code defines five permission modes that form a spectrum from most restrictive to most permissive.
+
+<Tabs>
+  <Tab title="default">
+    **Per-use confirmation** — the most conservative mode.
+
+    Aside from tools explicitly permitted by allow rules, every tool call requires user confirmation. This is the experience when an ordinary user starts Claude Code with no extra flags.
+
+    **When to use:** Daily interactive development. You want to confirm before the agent performs any potentially risky operation, maintaining full control over its behavior.
+
+    **Trade-off:** Safest but most tedious. For a large refactoring task, the agent may need dozens of file edits and command runs — each confirmation interrupts your train of thought.
+
+    ```bash
+    # Start Claude Code in default mode (no flag needed — it is the default)
+    claude
+    ```
+  </Tab>
+  <Tab title="plan">
+    **Read-only focused** — restricts the agent to read-only operations. The UI indicator is a pause icon.
+
+    In plan mode, write tools (`Edit`, `Write`) return `deny` from their `checkPermissions` method. Read tools (`Read`, `Grep`, `Glob`) are permitted normally.
+
+    **When to use:** Code review and architecture analysis. You want the agent to first "look at" the code without modifying anything, provide analysis and suggestions, and then you decide whether to execute modifications.
+
+    **Design philosophy:** "Understand before acting." The agent first surveys the codebase in read-only mode, proposes a modification plan, and switches to execution mode after you approve. This two-phase workflow is particularly effective on large codebases.
+
+    ```bash
+    # Start in plan mode
+    claude --plan
+    ```
+
+    <Note>
+    When plan mode's bypass availability flag is `true`, it means you were originally using bypass mode and then switched to plan mode. In this case the bypass permission logic still takes effect.
+    </Note>
+  </Tab>
+  <Tab title="auto">
+    **AI classifier automatic approval** — one of Claude Code's most sophisticated modes.
+
+    In `auto` mode, an AI classifier (the "YOLO classifier") replaces manual approval. When the pipeline reaches `ask` state and the mode is `auto`, the system invokes the classifier: it formats the tool name and input into a classifier-understandable format and sends the conversation context and tool list for reference.
+
+    **Optimizations to reduce classifier overhead:**
+
+    1. **`acceptEdits` fast path** — before calling the classifier, check if the tool would be permitted under `acceptEdits` mode. If yes, approve directly without an API call.
+    2. **Safe tool allowlist** — `Read`, `Grep`, `Glob`, `TodoWrite`, and other read-only or low-risk tools skip classifier checking entirely.
+    3. **Rejection tracking** — when the classifier consecutively rejects multiple times, the system automatically falls back to interactive prompting, acting as a circuit breaker.
+
+    ```bash
+    # Start in auto mode
+    claude --dangerously-skip-permissions
+    ```
+
+    <Warning>
+    `auto` mode is **not suitable** for: (1) production environment deployments; (2) operations involving sensitive data (keys, credentials); (3) irreversible operations (such as deleting databases). In these scenarios, use `default` mode or configure explicit deny rules, even if you trust the classifier's judgment.
+
+    Additionally, decisions for certain security check types — such as operations involving `.git/` and `.claude/` directories — are **classifier-immune**. Even if the classifier attempts to approve them, these security checks cannot be bypassed.
+    </Warning>
+  </Tab>
+  <Tab title="bypassPermissions">
+    **Full bypass** — the permission system's "off switch."
+
+    When activated, all tool calls are automatically approved except those blocked by deny rules and non-bypassable security checks.
+
+    **When to use:** CI/CD pipelines, automated testing, controlled execution environments where the agent's operations are already secured through other means (container isolation, network isolation), and permission checking only adds unnecessary latency.
+
+    Even in bypass mode, the following defenses remain active:
+
+    - Stage 2 deny rules (executed before the bypass check)
+    - `requiresUserInteraction` checks
+    - Content-level ask rules
+    - `safetyCheck` (always active, cannot be bypassed)
+
+    ```bash
+    # Bypass mode (requires explicit flag)
+    claude --dangerously-skip-permissions
+    ```
+
+    <Warning>
+    **Enterprise security best practices for bypass mode:**
+    1. Run Claude Code in a container or virtual machine to ensure file system isolation.
+    2. Configure explicit deny rules to block dangerous operations (e.g., `Bash(rm -rf *)`, `Bash(npm publish)`).
+    3. Use `--allowedTools` to limit the available tool scope.
+    4. Enable audit logging to record all tool calls.
+    </Warning>
+  </Tab>
+  <Tab title="bubble">
+    **Sub-agent permission bubbling** — an internal mode (not externally exposed).
+
+    When the main agent spawns a sub-agent, the sub-agent's permission checks "bubble up" back to the main agent's permission context, ensuring the sub-agent cannot gain permissions beyond those of the main agent.
+
+    ```typescript
+    // Sub-agents are created with bubble mode via createSubagentContext
+    const subagentContext = createSubagentContext(parentContext, {
+      permissionMode: 'bubble',
+      // Sub-agent's permission boundary cannot exceed the parent's
+    });
+    ```
+
+    The internal permission mode type includes all modes (including `auto` and `bubble`), while an external visibility check function ensures internal modes are never leaked to external interfaces. This type design embodies the **information hiding** principle — external users do not need to know `bubble` mode exists; it is an internal implementation detail.
+
+    <Note>
+    `bubble` mode is closely related to `AgentTool`. When `AgentTool` creates sub-agents via `createSubagentContext`, it sets bubble mode to ensure the sub-agent's permission boundary does not exceed that of the main agent.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## BashTool permission details
+
+The Bash tool has the most complex permission logic in the pipeline because the composability and expressiveness of shell commands far exceed those of other tools. A simple `git` command can be safe (`git status`) or dangerous (`git push --force origin main`). The permission system needs to understand command semantics, not merely match command names.
+
+### Rule matching patterns
+
+Bash permission rules support three formats of increasing expressiveness:
+
+<CardGroup cols={2}>
+  <Card title="Exact match" icon="equals">
+    **Syntax:** `Bash(npm test)`
+
+    Matches only the precise command string `npm test`. Zero false-approval risk.
+
+    **Best for:** Fixed steps in CI/CD pipelines where the exact command is known in advance.
+
+    ```json
+    { "allow": ["Bash(npm test)"] }
+    ```
+  </Card>
+  <Card title="Prefix match" icon="filter">
+    **Syntax:** `Bash(npm:*)`
+
+    Matches all commands starting with `npm` — `npm install`, `npm run build`, `npm ci`, etc.
+
+    **Best for:** Authorizing an entire toolchain while keeping the rules readable and auditable.
+
+    ```json
+    { "allow": ["Bash(npm:*)"] }
+    ```
+  </Card>
+  <Card title="Wildcard match" icon="asterisk">
+    **Syntax:** `Bash(git commit *)`
+
+    Matches `git commit` followed by any arguments. Supports escaped `\*` and `\\` in patterns.
+
+    **Best for:** Command families like version control where subcommand structure is important.
+
+    ```json
+    { "allow": ["Bash(git commit *)"] }
+    ```
+  </Card>
+  <Card title="Multi-wildcard deny" icon="ban">
+    **Syntax:** `Bash(* > /etc/*)`
+
+    Multiple wildcards can be combined in deny rules to intercept entire classes of dangerous operations.
+
+    **Best for:** Blocking writes to sensitive system directories regardless of the specific command used.
+
+    ```json
+    { "deny": ["Bash(* > /etc/*)"] }
+    ```
+  </Card>
+</CardGroup>
+
+<Tip>
+Prefer prefix matching (`:*` syntax) over wildcard matching when both express the same intent. `Bash(npm:*)` more explicitly communicates "all commands starting with `npm`" than `Bash(npm *)`, and is less prone to accidental over-matching.
+</Tip>
+
+**A subtle equivalence:** When a pattern ends with ` *` (space plus wildcard) and this is the only wildcard, the trailing space and arguments become optional. This means `git *` matches both `git add .` and the bare `git` command — semantically equivalent to `git:*`. You do not need to remember two different syntax rules.
+
+### The speculative classifier: a 2-second Promise race
+
+The Bash tool has its own classifier automatic approval mechanism that runs in parallel with the `auto` mode YOLO classifier. When a permission request enters the `ask` state, the system speculatively runs a classifier check against a 2-second timer:
+
+```typescript
+// Conceptual implementation of the speculative classifier race
+async function speculativeClassifierCheck(
+  toolCall: BashToolCall
+): Promise<ClassifierResult | null> {
+  const classifierPromise = runClassifier(toolCall);
+  const timeoutPromise = new Promise<null>(resolve =>
+    setTimeout(() => resolve(null), 2000)  // 2-second timeout
+  );
+
+  // Race: classifier result vs. timeout
+  const result = await Promise.race([classifierPromise, timeoutPromise]);
+
+  if (result && result.confidence >= CONFIDENCE_THRESHOLD) {
+    // High-confidence result within 2 seconds — auto-approve
+    return result;
+  }
+
+  // Timed out or low confidence — fall through to interactive prompt
+  return null;
+}
+```
+
+If the classifier returns a high-confidence matching result within 2 seconds, the operation is automatically approved. Otherwise, the user sees the interactive prompt. This "best effort" strategy ensures the classifier never becomes a user experience bottleneck.
+
+The 2-second timeout is a deliberate trade-off:
+
+| Timeout | Problem |
+|---|---|
+| Too short (e.g., 500 ms) | Network latency may prevent the classifier from responding in time; users see unnecessary prompts |
+| Too long (e.g., 10 s) | Users feel the wait is excessive |
+| 2 seconds (chosen) | Simple commands typically respond within 1 second; complex commands don't leave users waiting too long |
+
+---
+
+## Permission updates and persistence
+
+### The PermissionUpdate pattern
+
+Permission updates are expressed through the `PermissionUpdate` union type, which supports six operations:
+
+| Operation | Description |
+|---|---|
+| `addRule` | Add a new allow/deny/ask rule |
+| `replaceRule` | Replace an existing rule |
+| `removeRule` | Remove a rule |
+| `setMode` | Change the permission mode |
+| `addDirectory` | Add an extra working directory |
+| `removeDirectory` | Remove a working directory |
+
+Each operation specifies which configuration source to apply to: global user settings, project-level settings, local settings (not committed), current session only, or command-line arguments.
+
+### Memory-first, persistence-async
+
+Two functions handle the dual requirements of responsiveness and durability:
+
+```typescript
+// Apply updates to the in-memory context — synchronous, immediate
+const updatedContext = applyPermissionUpdates(context, updates);
+
+// Write updates to the file system — asynchronous
+const persisted = await persistPermissionUpdates(updates);
+// Returns true if any persistent update occurred (for logging as "permanent" vs "temporary")
+```
+
+`applyPermissionUpdates` modifies the in-memory `PermissionContext` and takes effect immediately for the current session. `persistPermissionUpdates` writes to the file system so rules survive restarts — but only `local`, `user`, and `project` targets support persistence. `session` and `cliArg` updates are runtime-only.
+
+<Note>
+This "memory first, persistence asynchronous" pattern is common in high-performance systems: first ensure the in-memory state is correct (affecting current behavior), then asynchronously write to persistent storage (affecting future behavior). If persistence fails, the current session's behavior is unaffected — but the rules will be lost after a restart.
+</Note>
+
+### Configuration file strategy
+
+```
+.claude/
+├── settings.json        # Team-shared rules (commit to version control)
+└── settings.local.json  # Personal preferences (excluded by .gitignore)
+```
+
+<Tip>
+**Recommended team configuration strategy:**
+1. Place team-wide allow/deny rules in `.claude/settings.json` — committed to version control, ensuring all team members share the same security baseline.
+2. Place personal preference rules in `.claude/settings.local.json` — not committed to version control.
+3. Use session-level rules for temporary needs to avoid polluting persistent configuration.
+</Tip>
+
+---
+
+## Hands-on: configuring a project-level permission system
+
+### Basic project configuration
+
+For a Node.js project where you want the agent to run tests and use Git freely, but never publish packages or delete directories:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test)",
+      "Bash(npm run lint)",
+      "Bash(git:*)",
+      "Read",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Bash(npm publish)",
+      "Bash(rm -rf *)"
+    ]
+  }
+}
+```
+
+Rule breakdown:
+
+- `Bash(npm test)` — exact match; allows only this specific command
+- `Bash(git:*)` — prefix match; allows all `git` subcommands
+- `Read` — no rule content; allows all `Read` tool calls
+- `Bash(npm publish)` — deny rule with highest priority; always blocks publish
+
+### Fine-grained wildcard control
+
+For more surgical control, use wildcards to authorize command families and block patterns:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npx eslint *)"
+    ],
+    "deny": [
+      "Bash(npm publish *)",
+      "Bash(* > /etc/*)"
+    ]
+  }
+}
+```
+
+`Bash(npm run *)` matches `npm run build`, `npm run test:coverage`, and all other subcommands. `Bash(* > /etc/*)` uses multiple wildcards to intercept any command attempting to write to `/etc`, regardless of what command initiates the write.
+
+### Enterprise security template
+
+A security configuration for a development team:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(npm test)",
+      "Bash(npm run build)",
+      "Bash(npm run lint)",
+      "Bash(git:*)"
+    ],
+    "deny": [
+      "Bash(npm publish *)",
+      "Bash(docker push *)",
+      "Write(.github/workflows/*)",
+      "Bash(* /etc/*)",
+      "Bash(* /var/*)"
+    ]
+  }
+}
+```
+
+This configuration uses **deny-overrides-allow layering**: broad allow rules authorize basic operations, while precise deny rules exclude dangerous operations. Because deny always takes higher priority than allow, you can write permissive allow rules without worrying that they will inadvertently authorize prohibited operations.
+
+---
+
+## Key concepts at a glance
+
+<CardGroup cols={2}>
+  <Card title="Four-stage pipeline" icon="shield">
+    `validateInput` → rule matching → `checkPermissions` → interactive prompt. Any stage can short-circuit and make a final decision. No single checkpoint is a silver bullet; each layer provides independent defense.
+  </Card>
+  <Card title="Deny-overrides-allow" icon="ban">
+    Deny rules always take precedence over allow rules, regardless of source. Even in `bypassPermissions` mode, deny rules and `safetyCheck` remain active. Security policies are non-negotiable.
+  </Card>
+  <Card title="Immutable PermissionContext" icon="lock">
+    Every permission update produces a new context object. This ensures concurrent safety: when multiple tools check permissions simultaneously, no tool sees a context modified mid-check by another tool.
+  </Card>
+  <Card title="ResolveOnce race" icon="zap">
+    The race between user interaction and classifier auto-approval is resolved by `claim()` — a lightweight atomic mutex. Only one decision-maker wins; subsequent claims are ignored.
+  </Card>
+  <Card title="Five-mode spectrum" icon="sliders">
+    From `default` (strictest) through `plan` (read-only), `auto` (AI classifier), and `bypassPermissions` (full bypass) to `bubble` (sub-agent delegation) — five modes covering the full range from interactive development to CI/CD automation.
+  </Card>
+  <Card title="Bash rule matching" icon="terminal">
+    Three rule formats — exact (`Bash(npm test)`), prefix (`Bash(npm:*)`), and wildcard (`Bash(git commit *)`) — plus a speculative 2-second classifier race give BashTool the most sophisticated permission logic in the pipeline.
+  </Card>
+</CardGroup>
+
+<Note>
+The seven design patterns in this chapter — multi-stage pipeline, deny priority, immutable context, atomic race resolution, five-mode spectrum, fine-grained Bash rules, and dual-layer persistence — are not Claude Code-specific optimizations. They are general answers to the universal challenge of balancing automation efficiency against security in any autonomous agent system.
+</Note>

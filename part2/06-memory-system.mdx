@@ -1,0 +1,321 @@
+---
+title: "The Memory System — Agent's Long-Term Memory"
+description: "How Claude Code's file-based memory architecture persists non-derivable knowledge across sessions using four typed memory categories, a MEMORY.md index, and a cache-aware Fork extraction pattern."
+---
+
+Humans maintain coherence across multiple conversations because of long-term memory. A truly useful agent cannot start from scratch every session — it needs to remember who the user is, what the project is doing, and which practices have been validated. Claude Code's memory system (`memdir`) was built for exactly this purpose: a file-based, typed, cross-session persistent memory architecture.
+
+The context window is "working memory" — it temporarily holds information within a single session. The `memdir` system is "long-term memory" — it persistently stores non-derivable critical knowledge across sessions.
+
+## The four memory types
+
+### A closed type system
+
+Claude Code constrains memory to exactly four types: `user`, `feedback`, `project`, and `reference`.
+
+The design philosophy: **only save information that cannot be derived from the current project state.** Code patterns, architecture, file structure, and Git history can all be obtained in real time through tools (`grep`, `git log`), so they do not belong in memory.
+
+**Why a closed system?** An open system allowing arbitrary custom types appears more flexible, but in an agent scenario it produces fatal problems: type explosion makes it impossible to efficiently determine relevance; classification ambiguity leads to duplicate storage; index bloat adds unnecessary complexity. The closed four-type system embodies "constraint is freedom" — constraining the classification method yields efficient, consistent reasoning.
+
+### Detailed analysis of the four types
+
+<Tabs>
+  <Tab title="user — User profile">
+    Stores the user's role, goals, and knowledge background. Helps the agent adjust its collaboration style for users of different expertise levels.
+
+    **When to save:** When learning about the user's role, preferences, or knowledge background.
+
+    **How it's used:** When adjusting explanation depth and collaboration style based on user expertise.
+
+    **Example:** When a user says "I've been writing Go for ten years, but this is my first time touching React," the agent saves a `user`-type memory and uses backend analogies when explaining frontend concepts in future sessions.
+
+    **Cross-project sharing:** `user`-type memories are stored in the user's global directory, so they naturally apply across all projects — preferences expressed in project A are honored in project B.
+  </Tab>
+  <Tab title="feedback — Behavioral directives">
+    Records the user's corrections and confirmations regarding agent behavior. This is one of the most important types — it enables behavioral consistency across future conversations.
+
+    **When to save:** When the user corrects your approach ("don't do that") or confirms a non-obvious successful practice.
+
+    **Body structure:** The rule itself + `Why:` reason + `How to apply:` applicable scenarios.
+
+    **Key design:** Saves both failures (corrections) and successes (confirmations). If only corrections are saved, the agent becomes overly cautious, deviating from validated methods.
+
+    **Example:** "Don't use `var`, use `const` and `let` for everything" → agent defaults to `const`/`let` in all subsequent generated code.
+  </Tab>
+  <Tab title="project — Project state">
+    Records the non-code state of a project — decisions, deadlines, work in progress. Code and Git history are derivable, but "why it was done this way" and "when it needs to be completed" are not.
+
+    **When to save:** When learning about who is doing what, why, and when it will be completed.
+
+    **Body structure:** Fact or decision + `Why:` motivation + `How to apply:` impact on recommendations.
+
+    **Critical rule:** Relative dates must be converted to absolute dates. "Thursday" must become "2026-04-03" — memories persist across sessions, and relative dates become meaningless in future conversations.
+
+    **Example:** "The authentication module uses JWT instead of Session because it needs to support mobile clients" → agent understands the background of this decision when authentication-related code needs modification.
+  </Tab>
+  <Tab title="reference — External references">
+    Pointers to external systems — Linear projects, Grafana dashboards, Slack channels. This information is not in the code repository but is critical for understanding project context.
+
+    **When to save:** When learning about external system resources and their purposes.
+
+    **How it's used:** When the user references external systems or needs to look up external information.
+
+    **Example:** "The production Grafana dashboard is at `https://grafana.company.com/d/abc123`" → agent can remind the user to check this dashboard when anomalies are mentioned.
+  </Tab>
+</Tabs>
+
+### Explicitly excluded information
+
+The memory type validation module defines content that **must not** be saved as memory:
+
+| Excluded content | Why | Correct approach |
+|---|---|---|
+| Code patterns, conventions, file paths | Derivable by reading code in real time | No memory needed |
+| Git history | `git log` / `git blame` are authoritative sources | No memory needed |
+| Debugging solutions | The fix is already in the code | Save only counter-intuitive "why" if present |
+| Documentation already in CLAUDE.md | Already accessible | No memory needed |
+| Temporary task details | Transient state of the current conversation | No memory needed |
+
+**Why the exclusion matters:** Agents can read the file system in real time — a tool call costs only milliseconds and a few hundred tokens. The value of memorizing derivable information is approximately zero. Memory should focus on what "cannot be acquired in real time": people's preferences, the rationale behind decisions, external links.
+
+<Warning>
+Even when a user explicitly requests saving derivable information, the correct response is to redirect: "If you want to save a list of PRs, tell me what's **surprising** or **non-obvious** about them — that's what's worth saving."
+</Warning>
+
+### Common misconceptions
+
+<AccordionGroup>
+  <Accordion title="Misconception: more memories is better">
+    Some users have the agent memorize every detail from conversations, leading to MEMORY.md index bloat and accumulation of low-value files. Too many memories increase the context burden for each conversation and cause the agent to be distracted by noise.
+
+    **Correct approach:** Regularly review the memory directory and delete outdated or low-value memories. A good memory should pass the test: "If this memory were deleted, would the agent's behavior be substantively different?"
+  </Accordion>
+  <Accordion title="Misconception: using memory as a documentation system">
+    Using the memory system as a replacement for project documentation violates the "only save non-derivable information" principle. Technical specifications should live in the `docs/` directory.
+
+    **Correct approach:** Place technical documentation in `docs/`. Save only the "why" behind architectural decisions in memory.
+  </Accordion>
+  <Accordion title="Misconception: ignoring the relative date problem">
+    The user says "this feature launches next Tuesday" and the agent saves "launches next Tuesday." Two days later, "next Tuesday" has shifted; a week later it refers to the past. This memory is not only useless but potentially misleading.
+
+    **Correct approach:** Always use absolute dates. Convert "next Tuesday" to a specific date (e.g., 2026-04-07) before saving.
+  </Accordion>
+</AccordionGroup>
+
+## Memory file format
+
+### Frontmatter structure
+
+Each memory is an independent Markdown file using YAML frontmatter to declare metadata. Three fields are required:
+
+```markdown
+---
+name: pre-commit-lint-requirement
+description: Must run npm run lint before every commit; CI failed for a full day due to unlinted code
+type: feedback
+---
+
+**Rule**: Run `npm run lint` before every code commit.
+
+**Why**: A previous commit with unlinted code caused CI to fail for an entire day, blocking the team.
+
+**How to apply**: Before using git commit, always run `npm run lint` first and fix any errors. This applies to all files changed in the commit, not just new files.
+```
+
+The `type` field must be one of the four valid types (strictly validated). Legacy files without a type field can continue to work but cannot be filtered by type.
+
+**Why Markdown files instead of a database?**
+
+| Advantage | Explanation |
+|---|---|
+| Readability | Developers can view and edit memory files with any text editor |
+| Version control | Memory files naturally support Git tracking |
+| Portability | The file system requires no additional dependencies |
+| Debuggability | `ls` and `cat` are sufficient for diagnosis |
+| Cost | No database connections, indexes, or backups to maintain |
+
+The only downside is limited query capability. For the agent's memory scenario — simple "load all relevant memories" — file system capabilities are sufficient.
+
+### The MEMORY.md index
+
+`MEMORY.md` is the entry point of the memory system — not a memory itself, but an index file. At the start of each conversation it is automatically loaded into the context, allowing the agent to quickly understand the overview of existing memories.
+
+Each index entry follows this format on a single line, no more than 150 characters:
+
+```markdown
+- [Title](file.md) -- One-line hook description
+```
+
+The index has dual capacity protection:
+
+| Limit | Value | Purpose |
+|---|---|---|
+| Line limit | 200 lines | Protects comprehension efficiency — ensures the index remains a "quick browse" tool |
+| Byte limit | 25 KB | Protects context budget — provides a hard cost ceiling |
+
+Truncation applies line limit first, then byte limit. This means: when there are fewer entries with longer descriptions, the byte limit triggers first; when there are more entries with shorter descriptions, the line limit triggers first.
+
+### Directory structure
+
+Memory files are stored at:
+
+```
+~/.claude/projects/<sanitized-git-root>/memory/
+```
+
+Path resolution checks these sources in order:
+
+1. `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` environment variable (full path override)
+2. `autoMemoryDirectory` setting — only from `policySettings`, `localSettings`, or `userSettings`
+3. Default path based on `memoryBase` and sanitized Git root
+
+<Warning>
+`projectSettings` is excluded from `autoMemoryDirectory` resolution for the same reason it is excluded from security-sensitive checks — a malicious repository could otherwise redirect memory writes to sensitive directories like `~/.ssh`. Path validation rejects relative paths, root paths, Windows drive letter roots, UNC paths, and null byte injection.
+</Warning>
+
+## Automatic memory extraction
+
+### The Fork pattern
+
+The memory extraction system does not run in the main conversation. Instead, it executes in the background through `runForkedAgent` — a "perfect fork" pattern. The background agent shares the exact same system prompt and tool set as the main conversation, meaning:
+
+- The background agent has the same context understanding capabilities as the main agent
+- The background agent uses the same tool set, but with stricter permission restrictions
+- **Prompt cache is shared between the main conversation and the background agent**
+
+Extraction triggers at the end of each complete query loop, when the model produces a final response with no tool calls.
+
+<Steps>
+  <Step title="Check for active memory save">
+    If the main agent already wrote a memory file during this conversation, skip extraction entirely (mutex mechanism).
+  </Step>
+  <Step title="Check throttle counter">
+    Extraction runs only after every several conversation rounds. If the counter threshold hasn't been reached, wait for the next conversation.
+  </Step>
+  <Step title="Fork background agent">
+    Create a background agent that shares the system prompt and tool list of the main conversation for cache sharing.
+  </Step>
+  <Step title="Extract and write memories">
+    The background agent analyzes the conversation, extracts valuable memories, and writes them to the memory directory only.
+  </Step>
+  <Step title="Update MEMORY.md index">
+    After writing memory files, update the MEMORY.md index with the new entries.
+  </Step>
+  <Step title="Handle trailing context">
+    If another conversation completed while extraction was in progress, run a trailing extraction using that staged context. Trailing extraction bypasses the throttle counter.
+  </Step>
+</Steps>
+
+**Why background extraction instead of direct extraction in the main conversation?**
+
+| Approach | Pros | Cons |
+|---|---|---|
+| Direct extraction in main conversation | Simple implementation | Increases user wait time; extraction failures may affect main conversation stability |
+| Background Fork extraction | Does not affect user experience; independent token budget; failures don't affect main conversation; shares cache to reduce costs | Higher implementation complexity; requires mutex mechanism |
+
+User experience is the critical consideration. At the end of a long conversation, the user expects the final result immediately. Even a few seconds of extraction delay would, cumulatively, severely degrade interaction fluency.
+
+### Mutex mechanism
+
+If the main agent actively saves a memory file during the current conversation, the background extraction skips entirely. The two are mutually exclusive — preventing duplicate writes of the same information.
+
+This design avoids redundant memories caused by "duplicate extraction": if the main agent saves "user prefers pnpm" and the background agent independently analyzes and determines the same thing, the same information produces two memories, wasting storage and increasing filtering burden.
+
+### Background agent tool permissions
+
+The background agent's permissions follow the Principle of Least Privilege:
+
+| Tool | Permission | Rationale |
+|---|---|---|
+| Read / Grep / Glob | Unrestricted (read-only) | Need to read code to understand conversation context |
+| Bash | Read-only commands only (`ls`, `find`, `grep`, etc.) | Need to view file state but cannot execute modification commands |
+| Edit / Write | Paths within memory directory only | Need to write memory files but cannot modify project code |
+| All other tools | Denied | Background agent should not trigger side effects like network requests |
+
+### Throttling and trailing extraction
+
+Extraction does not run after every conversation. A counter-based throttling mechanism ensures extraction triggers only after accumulating enough conversation rounds, improving the "information density" of each extraction. Each memory extraction requires an API call — for frequent short conversations (simple Q&A), the cost of extraction may exceed its value.
+
+The **trailing extraction** mechanism handles concurrency: when an extraction is already in progress and another conversation completes, the new context is staged. After the current extraction finishes, a trailing extraction runs using the latest staged context. Trailing extraction bypasses the throttle counter — it handles already-completed work and should not be delayed by throttling.
+
+Without trailing extraction, Conversation B's context might never be extracted if Conversation C starts before the extraction for B can be scheduled.
+
+## Cache-aware architecture
+
+### Prompt cache sharing
+
+Claude's API supports prompt caching — if consecutive requests share the same prefix, the API can reuse already-computed KV cache, significantly reducing latency and cost. The forked agent pattern implements cache sharing through the `CacheSafeParams` type, which extracts shared parameters including the system prompt, user context, system context, tool usage context, and message history.
+
+The background extraction agent's API request prefix is identical to the main conversation's — the API provider hits the cached prefix, avoiding recomputation.
+
+**Simplified cost impact:**
+
+```
+Assumptions:
+  System prompt + tool definitions ≈ 30,000 tokens
+  Message history ≈ 50,000 tokens (medium-length conversation)
+  Cached input price  = $0.10 / MTok
+  Standard input price = $3.00 / MTok
+
+Without cache sharing:
+  Extraction agent resends 80,000 tokens → $0.24
+
+With cache sharing:
+  Extraction agent reuses cache → $0.008
+
+Savings: 96.7%
+```
+
+### Tool list consistency
+
+Cache sharing has an implicit constraint: **the tool list is part of the API cache key.** If the forked agent uses a different tool set from the main agent, the cache cannot be hit.
+
+This is why tool permission filtering uses a `canUseTool` callback rather than a different tool list — the tool list remains consistent, with filtering applied only at execution time.
+
+<Info>
+This demonstrates an important architectural principle: **consistent interface, variable behavior.** Keep cache-related interface parameters (tool lists, system prompt prefixes) unchanged as much as possible, and place differentiation logic in runtime behavioral control.
+</Info>
+
+## Memory lifecycle and validation
+
+### Enabling and disabling memory
+
+The decision chain for enabling memory (evaluated in order):
+
+1. `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` environment variable → disabled
+2. `--bare` (SIMPLE mode) → disabled
+3. Claude Code Remote without persistent storage → disabled
+4. `autoMemoryEnabled: false` in `settings.json` → disabled
+5. Default: **enabled**
+
+Background extraction also requires passing through a GrowthBook feature gate — dual-layer control: a compile-time feature flag plus a runtime GrowthBook experiment.
+
+### Memory as a clue, not a conclusion
+
+The memory type validation module defines the core principle for memory reading: **memory is a point-in-time snapshot, not a current fact.**
+
+```
+"Memory says X exists" does not mean "X currently exists."
+```
+
+Validation rules before acting on a memory:
+
+- If the memory names a file path: check if the file exists
+- If the memory names a function or flag: grep to find it
+- If the user is about to act on a recommendation (not just asking about history): validate first
+
+This reflects a deliberate design philosophy. Three levels of trust exist:
+
+| Level | Approach | Status |
+|---|---|---|
+| Level 0 | No trust — re-acquire all information | Too conservative; defeats the purpose of memory |
+| Level 1 | Trust as clue — memory indicates direction, independently verify facts | **Claude Code's approach** |
+| Level 2 | Trust as fact — memory is current truth | Too aggressive; outdated memories mislead decisions |
+
+Claude Code choosing Level 1 is a pragmatic balance. Memories serve as "indices" and "guides" while the agent maintains independent verification of current state.
+
+**This principle is especially important for:**
+
+- **Code references** — a file mentioned in memory may have been moved during refactoring
+- **Dependency versions** — the team may have upgraded since the memory was saved
+- **Decision rationale** — the "why" behind a decision is unlikely to become outdated and can be trusted more directly

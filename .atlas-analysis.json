@@ -1,0 +1,93 @@
+{
+  "projectType": "general",
+  "projectName": "Yù Yú: Decoding Agent Harness",
+  "projectDescription": "A 420,000-character deep architectural analysis of Claude Code, dissecting the Agent Harness skeleton across 15 chapters — from the dialog loop to building your own AI agent runtime.",
+  "theme": "maple",
+  "primaryColor": "#9f7aea",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Book",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": ["introduction", "foreword"]
+          },
+          {
+            "group": "Part 1: Foundations",
+            "pages": [
+              "part1/01-new-paradigm",
+              "part1/02-dialog-loop",
+              "part1/03-tool-system",
+              "part1/04-permission-pipeline"
+            ]
+          },
+          {
+            "group": "Part 2: Core Systems",
+            "pages": [
+              "part2/05-settings-configuration",
+              "part2/06-memory-system",
+              "part2/07-context-management",
+              "part2/08-hook-system"
+            ]
+          },
+          {
+            "group": "Part 3: Advanced Patterns",
+            "pages": [
+              "part3/09-sub-agents-fork",
+              "part3/10-coordinator-pattern",
+              "part3/11-skill-system",
+              "part3/12-mcp-integration"
+            ]
+          },
+          {
+            "group": "Part 4: Engineering Practice",
+            "pages": [
+              "part4/13-streaming-architecture",
+              "part4/14-plan-mode",
+              "part4/15-build-your-own-harness"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Appendices",
+            "pages": [
+              "appendix/a-architecture-map",
+              "appendix/b-tool-inventory",
+              "appendix/c-feature-flags",
+              "appendix/d-glossary"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "15-chapter deep dive into Claude Code's Agent Harness architecture",
+    "Analysis of the dialog loop (while(true) async generator main loop)",
+    "Tool system: Tool<I,O,P> five-element protocol and 50+ registered tools across 12 categories",
+    "Permission pipeline: four-stage pipeline with speculative classifier",
+    "Context management: four-level progressive compression (Snip→MicroCompact→Collapse→AutoCompact)",
+    "Hook system: 26 lifecycle events with six-layer priority and three-layer security",
+    "Sub-agent Fork pattern with byte-level context inheritance",
+    "MCP integration: 8 transport protocols and five-state connection management",
+    "Streaming architecture with startup optimization from 160ms to 65ms (-59%)",
+    "139 Mermaid architecture diagrams and 50+ design decision analyses"
+  ],
+  "publicApiSurface": [
+    "Tool<I,O,P> protocol — five-element tool definition interface",
+    "buildTool() — fail-safe tool factory function",
+    "QueryDeps — dependency injection container for the dialog loop",
+    "MEMORY.md — memory index format for the agent's long-term memory",
+    "SKILL.md frontmatter — plugin definition format with parameter substitution",
+    "Hook JSON response protocol — lifecycle event hooks with six-layer priority",
+    "MCP transport protocols — 8 transport types for external protocol bridging",
+    "Feature flags — 89 flags across 13 categories for compile-time/runtime gating"
+  ]
+}
